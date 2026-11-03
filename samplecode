@@ -1,0 +1,453 @@
+cell-1
+# Mark this cell as the Fabric parameter cell after import if needed.
+p_client = 'ALL'  # ALL, CBG or AMPS
+p_routes_json = r'''[
+  {"client":"CBG", "source_folder":"Files/CBG_Claims", "target_table":"bronze_cbg_claims_raw",
+   "exception_table":"bronze_cbg_file_exceptions", "csv_delimiter":",", "txt_delimiter":"|",
+   "sheet_names":[], "allow_multiple_sheets":false},
+  {"client":"AMPS", "source_folder":"Files/AMPS_Claims", "target_table":"bronze_amps_claims_raw",
+   "exception_table":"bronze_amps_file_exceptions", "csv_delimiter":",", "txt_delimiter":"|",
+   "sheet_names":[], "allow_multiple_sheets":false}
+]'''
+p_empty_folder_is_error = False  # existing empty client folders are NO_INPUT, not failed
+p_filepath = ''  # empty = inspect client folder; single filename/path requires p_client=CBG or AMPS
+p_recursive = False
+p_staging_folder = 'Files/_bronze_eav_staging'  # keep OUTSIDE the source folder
+p_quarantine_folder = ''  # optional e.g. Files/claims_exceptions; keep outside source
+p_csv_delimiter = ','  # fallback when route does not specify csv_delimiter
+p_txt_delimiter = '|'  # fallback when route does not specify txt_delimiter
+p_encoding = 'utf-8-sig'
+p_header_row = 0  # skip this many CSV logical records / Excel worksheet rows, then first nonblank is header
+p_sheet_names_json = '[]'  # e.g. '["Claims"]'; [] selects all workbook sheets
+p_allow_multiple_sheets = False  # explicit selected sheet list can select one from a multi-sheet workbook
+p_allow_blank_headers = False
+p_pad_short_rows = False  # strict default; True pads missing trailing fields with null
+p_batch_cells = 25000
+p_max_eav_cells = 5000000  # per-file expansion guard; 100k rows x 52 fields = 5.2m cells
+p_max_input_bytes = 512 * 1024 * 1024
+p_max_excel_bytes = 50 * 1024 * 1024
+p_transform_engine = 'pyspark'  # 'pyspark' or 'spark_sql'
+p_run_optimize = False  # prefer scheduled maintenance
+p_fail_on_error = True
+p_return_json = True
+
+
+cell-2
+import csv, json, re, hashlib, tempfile, itertools
+from pathlib import Path
+from datetime import date, datetime, timezone
+import openpyxl
+from notebookutils import mssparkutils
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, StringType, LongType, TimestampType
+
+RUN_ID = __import__('uuid').uuid4().hex
+ALLOWED = {'.csv', '.txt', '.xlsx'}
+
+def boolean(value):
+    if isinstance(value, bool): return value
+    if str(value).strip().lower() in {'true', '1'}: return True
+    if str(value).strip().lower() in {'false', '0'}: return False
+    raise ValueError('Boolean parameter must be true or false')
+
+def integer(value, minimum=0):
+    number = int(value)
+    if number < minimum: raise ValueError('Numeric parameter out of range')
+    return number
+
+def table_id(name):
+    parts = str(name).split('.')
+    if not 1 <= len(parts) <= 3 or any(not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', p) for p in parts):
+        raise ValueError('Use one to three simple table identifier components')
+    return '.'.join('`' + p + '`' for p in parts)
+
+def storage_path(value):
+    path = str(value).strip().replace('\\', '/')
+    if path.startswith('/lakehouse/default/'):
+        path = path[len('/lakehouse/default/'):]
+    if not (path.startswith('Files/') or path.startswith('abfss://')):
+        raise ValueError('Use Files/... or an explicit ABFSS path')
+    if any(p in {'.', '..'} for p in path.split('/')):
+        raise ValueError('Relative traversal segments are not allowed')
+    return path.rstrip('/')
+
+def input_path(value, folder):
+    if value is None or not str(value).strip(): return None
+    decoded = value
+    for _ in range(2):
+        if not isinstance(decoded, str): break
+        try: decoded = json.loads(decoded)
+        except (ValueError, TypeError): break
+    if isinstance(decoded, dict):
+        paths = [decoded[k] for k in ('path','file_path','p_filepath') if k in decoded]
+        if len(paths) != 1: raise ValueError('JSON must contain exactly one supported path key')
+        decoded = paths[0]
+    if not isinstance(decoded, str) or not decoded.strip(): raise ValueError('Invalid input path')
+    decoded = decoded.strip().replace('\\', '/')
+    if decoded.startswith(('Files/', 'abfss://', '/lakehouse/default/')):
+        return storage_path(decoded)
+    return storage_path(folder + '/' + decoded)
+
+def validate_routes(raw, selected_client):
+    routes = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(routes, list) or not routes: raise ValueError('Routes must be a nonempty JSON list')
+    clients, folders, destinations, exceptions, normalized = set(), [], set(), set(), []
+    for item in routes:
+        if not isinstance(item, dict): raise ValueError('Every route must be a JSON object')
+        client = str(item.get('client', '')).strip().upper()
+        if client not in {'CBG', 'AMPS'}: raise ValueError('Client must be CBG or AMPS')
+        if client in clients: raise ValueError('Duplicate client route')
+        clients.add(client)
+        folder = storage_path(item['source_folder'])
+        if any(folder == other or folder.startswith(other + '/') or other.startswith(folder + '/') for other in folders):
+            raise ValueError('Client input folders must be distinct and non-overlapping')
+        folders.append(folder)
+        target = str(item['target_table']); exception = str(item['exception_table'])
+        table_id(target); table_id(exception)
+        if target.lower() in destinations: raise ValueError('Each client must have its own Bronze table')
+        if exception.lower() in exceptions: raise ValueError('Each client must have its own exception table')
+        destinations.add(target.lower()); exceptions.add(exception.lower())
+        for key in ('csv_delimiter', 'txt_delimiter'):
+            if key in item and len(str(item[key])) != 1: raise ValueError('Use single-character delimiters')
+        if 'sheet_names' in item:
+            sheets = item['sheet_names']
+            if not isinstance(sheets, list) or any(not isinstance(x, str) for x in sheets) or len(sheets) != len(set(sheets)):
+                raise ValueError('Route sheet_names must be a unique string list')
+        normalized.append({**item, 'client':client, 'source_folder':folder,
+                           'target_table':target, 'exception_table':exception})
+    if destinations & exceptions: raise ValueError('Bronze and exception tables must not overlap')
+    chosen = str(selected_client).strip().upper()
+    if chosen == 'ALL': return normalized
+    selected = [r for r in normalized if r['client'] == chosen]
+    if not selected: raise ValueError('Selected client has no configured route')
+    return selected
+
+ALL_ROUTES = validate_routes(p_routes_json, 'ALL')
+ROUTES = validate_routes(p_routes_json, p_client)
+if str(p_filepath).strip() and str(p_client).strip().upper() == 'ALL':
+    raise ValueError('For a single file, explicitly select CBG or AMPS')
+# Initialize helper configuration; the execution cell overrides it for each route.
+p_source_folder = ROUTES[0]['source_folder']
+p_target_table = ROUTES[0]['target_table']
+p_exception_table = ROUTES[0]['exception_table']
+
+# Typed config is evaluated after Fabric injects pipeline parameters.
+CFG = {
+    'source': storage_path(p_source_folder), 'stage': storage_path(p_staging_folder),
+    'target': str(p_target_table), 'exception': str(p_exception_table),
+    'recursive': boolean(p_recursive), 'allow_multi': boolean(p_allow_multiple_sheets),
+    'blank_headers': boolean(p_allow_blank_headers), 'pad_short': boolean(p_pad_short_rows),
+    'header_row': integer(p_header_row), 'batch': integer(p_batch_cells, 1),
+    'max_cells': integer(p_max_eav_cells, 1),
+    'max_bytes': integer(p_max_input_bytes, 1), 'max_excel': integer(p_max_excel_bytes, 1),
+    'csv_sep': str(p_csv_delimiter), 'txt_sep': str(p_txt_delimiter),
+    'encoding': str(p_encoding), 'engine': str(p_transform_engine).lower(),
+    'quarantine': storage_path(p_quarantine_folder) if str(p_quarantine_folder).strip() else None,
+}
+table_id(CFG['target']); table_id(CFG['exception'])
+if CFG['target'].lower() == CFG['exception'].lower(): raise ValueError('Target and exception table must differ')
+if CFG['engine'] not in {'pyspark', 'spark_sql'}: raise ValueError('Unknown transformation engine')
+if len(CFG['csv_sep']) != 1 or len(CFG['txt_sep']) != 1: raise ValueError('Use a single-character delimiter')
+for output in [CFG['stage'], CFG['quarantine']]:
+    if output and (output == CFG['source'] or output.startswith(CFG['source'] + '/')):
+        raise ValueError('Staging/quarantine folder cannot be inside the intake folder')
+SHEETS = json.loads(p_sheet_names_json) if isinstance(p_sheet_names_json, str) else p_sheet_names_json
+if not isinstance(SHEETS, list) or any(not isinstance(s, str) for s in SHEETS) or len(set(SHEETS)) != len(SHEETS):
+    raise ValueError('p_sheet_names_json must be a list of unique sheet names')
+SINGLE_FILE = input_path(p_filepath, CFG['source'])
+
+# Validate working folders against every route before any data writes.
+for route in ALL_ROUTES:
+    for output in [CFG['stage'], CFG['quarantine']]:
+        if output and (output == route['source_folder'] or output.startswith(route['source_folder'] + '/')):
+            raise ValueError('Staging/quarantine folder cannot be inside any intake folder')
+
+
+cell-3
+EAV_SCHEMA = StructType([
+    StructField('FileName', StringType(), True),
+    StructField('SheetName', StringType(), True),
+    StructField('ColumnPlaceholder', StringType(), True),
+    StructField('RawColumnName', StringType(), True),
+    StructField('ColumnDataType', StringType(), True),
+    StructField('Value', StringType(), True),
+    StructField('RowNumber', LongType(), True),
+])
+BRONZE_SCHEMA = StructType(EAV_SCHEMA.fields + [StructField('LoadDate', TimestampType(), True)])
+EXCEPTION_SCHEMA = StructType([
+    StructField('FileName', StringType(), True), StructField('FilePath', StringType(), True),
+    StructField('ExceptionReason', StringType(), True), StructField('FailedStage', StringType(), True),
+    StructField('LoggedDate', TimestampType(), True), StructField('FieldName', StringType(), True),
+    StructField('Layer', StringType(), True),
+])
+
+def ensure_compatible_table(name, schema):
+    if not spark.catalog.tableExists(name): return
+    actual = {f.name.lower(): f.dataType.simpleString() for f in spark.table(name).schema.fields}
+    expected = {f.name.lower(): f.dataType.simpleString() for f in schema.fields}
+    if actual != expected:
+        raise ValueError('Destination schema mismatch; use a compatible EAV/exception table')
+
+def observed_type(value):
+    if value is None or value == '': return 'Null'
+    if isinstance(value, bool): return 'Boolean'
+    if isinstance(value, int): return 'Integer'
+    if isinstance(value, float): return 'Float'
+    if isinstance(value, (datetime, date)): return 'Timestamp'
+    return 'String'
+
+def header_names(values, allow_blank=False):
+    headers = []
+    for index, value in enumerate(values, 1):
+        if value is None or not str(value).strip():
+            if not allow_blank: raise ValueError('Blank header: verify row and terminal delimiter')
+            headers.append(f'Column_{index}')
+        else:
+            headers.append(str(value))  # preserve spelling/case/spaces; position distinguishes duplicates
+    if not headers: raise ValueError('No header fields')
+    return headers
+
+def nonblank(values):
+    return bool(values) and any(v is not None and str(v).strip() for v in values)
+
+def rows_as_eav(rows, file_path, sheet_name, cfg):
+    headers, data_row = None, 0
+    for physical_index, row in enumerate(rows):
+        if physical_index < cfg['header_row']: continue
+        row = list(row)
+        if not nonblank(row): continue
+        if headers is None:
+            headers = header_names(row, cfg['blank_headers'])
+            if len(headers) < 2:
+                raise ValueError('One field detected; verify delimiter or adapt for valid single-field input')
+            continue
+        if len(row) > len(headers): raise ValueError('Row has more values than headers')
+        if len(row) < len(headers):
+            if not cfg['pad_short']: raise ValueError('Row has fewer values than headers')
+            row += [None] * (len(headers) - len(row))
+        data_row += 1
+        for column_index, (name, value) in enumerate(zip(headers, row), 1):
+            yield (file_path, sheet_name, f'C{column_index}', name, observed_type(value),
+                   None if value is None else str(value), int(data_row))
+    if headers is None: raise ValueError('Empty file or sheet')
+    if data_row == 0: raise ValueError('Header-only file or sheet')
+
+def csv_eav(local_path, file_path, cfg):
+    sep = cfg['txt_sep'] if Path(local_path).suffix.lower() == '.txt' else cfg['csv_sep']
+    csv.field_size_limit(16 * 1024 * 1024)
+    with open(local_path, 'r', encoding=cfg['encoding'], newline='') as stream:
+        rows = csv.reader(stream, delimiter=sep, quotechar='"', doublequote=True, strict=True)
+        yield from rows_as_eav(rows, file_path, 'CSV_DEFAULT', cfg)
+
+def excel_eav(local_path, file_path, cfg, selected_sheets):
+    workbook = openpyxl.load_workbook(local_path, read_only=True, data_only=True)
+    try:
+        names = selected_sheets or list(workbook.sheetnames)
+        if not names or any(name not in workbook.sheetnames for name in names):
+            raise ValueError('Selected worksheet does not exist')
+        if len(names) > 1 and not cfg['allow_multi']:
+            raise ValueError('Select one worksheet or allow multiple sheets')
+        for name in names:
+            yield from rows_as_eav(workbook[name].iter_rows(values_only=True), file_path, name, cfg)
+    finally:
+        workbook.close()
+
+cell-4
+def bronze_projection(stage_df, engine, loaded_at):
+    if engine == 'pyspark':
+        return stage_df.select(
+            F.col('FileName'), F.col('SheetName'), F.col('ColumnPlaceholder'),
+            F.col('RawColumnName'), F.col('ColumnDataType'), F.col('Value'),
+            F.col('RowNumber').cast('long').alias('RowNumber'),
+            F.lit(loaded_at).cast('timestamp').alias('LoadDate'))
+    stage_df.createOrReplaceTempView('_bronze_eav_stage')
+    spark.createDataFrame([(loaded_at,)], 'LoadDate timestamp').createOrReplaceTempView('_bronze_eav_load_time')
+    return spark.sql("""
+        SELECT s.FileName, s.SheetName, s.ColumnPlaceholder, s.RawColumnName,
+               s.ColumnDataType, s.Value, CAST(s.RowNumber AS BIGINT) AS RowNumber,
+               t.LoadDate
+        FROM _bronze_eav_stage s CROSS JOIN _bronze_eav_load_time t
+    """)
+
+def replace_file_slice(df, file_path):
+    ensure_compatible_table(CFG['target'], BRONZE_SCHEMA)
+    writer = df.write.format('delta')
+    if spark.catalog.tableExists(CFG['target']):
+        # UTF-8 hex avoids inserting untrusted path characters into predicate SQL.
+        encoded = file_path.encode('utf-8').hex()
+        predicate = f"FileName = CAST(unhex('{encoded}') AS STRING)"
+        writer.mode('overwrite').option('replaceWhere', predicate).saveAsTable(CFG['target'])
+    else:
+        writer.mode('errorifexists').saveAsTable(CFG['target'])
+
+
+cell-5
+def configure_client(route):
+    global CFG, SINGLE_FILE, SHEETS
+    CFG = {**BASE_CFG, 'source':route['source_folder'], 'target':route['target_table'],
+           'exception':route['exception_table'],
+           'csv_sep':str(route.get('csv_delimiter', p_csv_delimiter)),
+           'txt_sep':str(route.get('txt_delimiter', p_txt_delimiter)),
+           'encoding':str(route.get('encoding', p_encoding)),
+           'allow_multi':boolean(route.get('allow_multiple_sheets', p_allow_multiple_sheets))}
+    SHEETS = route.get('sheet_names', DEFAULT_SHEETS)
+    SINGLE_FILE = input_path(p_filepath, CFG['source'])
+    if SINGLE_FILE and not SINGLE_FILE.startswith(CFG['source'] + '/'):
+        raise ValueError('Single-file path is outside the selected client input folder')
+
+BASE_CFG = dict(CFG)
+DEFAULT_SHEETS = list(SHEETS)
+
+def files_to_process():
+    if SINGLE_FILE:
+        if not mssparkutils.fs.exists(SINGLE_FILE): raise FileNotFoundError('Source file not found')
+        return [SINGLE_FILE]
+    if not mssparkutils.fs.exists(CFG['source']): raise FileNotFoundError('Source folder not found')
+    def walk(folder):
+        for item in mssparkutils.fs.ls(folder):
+            if item.isDir:
+                if CFG['recursive']: yield from walk(item.path)
+            else:
+                # Preserve relative Files path when source parameter is relative.
+                yield folder.rstrip('/') + '/' + item.name
+    return sorted(walk(CFG['source']))
+
+def stage_eav(records, stage_path):
+    total = 0
+    iterator = iter(records)
+    try:
+        while True:
+            batch = list(itertools.islice(iterator, CFG['batch']))
+            if not batch: break
+            total += len(batch)
+            if total > CFG['max_cells']: raise ValueError('Per-file EAV cell limit exceeded')
+            (spark.createDataFrame(batch, EAV_SCHEMA).write.mode('append')
+             .parquet(stage_path))
+    finally:
+        close = getattr(iterator, 'close', None)
+        if close: close()
+    if total == 0: raise ValueError('No EAV records produced')
+    return total
+
+def exception_record(file_path, stage, exception_type):
+    # Avoid persisting source row values from exception messages.
+    reason = f'{exception_type}; stage={stage}; run_id={RUN_ID}. Inspect secured run diagnostics.'
+    record = (file_path, file_path, reason, stage, datetime.now(timezone.utc).replace(tzinfo=None), None, 'Bronze')
+    ensure_compatible_table(CFG['exception'], EXCEPTION_SCHEMA)
+    (spark.createDataFrame([record], EXCEPTION_SCHEMA).write.format('delta')
+     .mode('append').saveAsTable(CFG['exception']))
+
+cell-6
+def process_client(route):
+    configure_client(route)
+    successes, failures, skipped, warnings = [], [], [], []
+    try:
+        ensure_compatible_table(CFG['target'], BRONZE_SCHEMA)
+        ensure_compatible_table(CFG['exception'], EXCEPTION_SCHEMA)
+        paths = files_to_process()
+        if not paths and boolean(p_empty_folder_is_error): raise ValueError('Source folder is empty')
+        for source_path in paths:
+            source_path = storage_path(source_path)
+            suffix = Path(source_path).suffix.lower()
+            if suffix not in ALLOWED or source_path.rsplit('/', 1)[-1].startswith('~$'):
+                skipped.append({'FileName': source_path, 'Status': 'SKIPPED'})
+                continue
+            stage_path = CFG['stage'] + '/' + RUN_ID + '/' + hashlib.sha256(source_path.encode()).hexdigest()
+            stage = 'Source validation'
+            try:
+                # Do not parse stage/quarantine objects passed accidentally as single-file input.
+                for folder in [CFG['stage'], CFG['quarantine']]:
+                    if folder and (source_path == folder or source_path.startswith(folder + '/')):
+                        raise ValueError('Source overlaps an output working folder')
+                with tempfile.TemporaryDirectory(prefix='bronze_eav_') as temp_dir:
+                    local_path = str(Path(temp_dir) / ('input' + suffix))
+                    # Listing the parent lets us enforce size BEFORE copying.
+                    parent, filename = source_path.rsplit('/', 1)
+                    matches = [f for f in mssparkutils.fs.ls(parent) if f.name == filename and not f.isDir]
+                    if len(matches) != 1: raise FileNotFoundError('Expected one source file')
+                    size = int(matches[0].size)
+                    limit = min(CFG['max_bytes'], CFG['max_excel']) if suffix == '.xlsx' else CFG['max_bytes']
+                    if size <= 0 or size > limit: raise ValueError('Empty input or input size limit exceeded')
+                    stage = 'Local snapshot copy'
+                    copied = mssparkutils.fs.cp(source_path, Path(local_path).as_uri(), False)
+                    if copied is False: raise IOError('Source copy failed')
+                    if Path(local_path).stat().st_size != size: raise ValueError('Source changed during snapshot copy')
+                    # Land completed immutable files; same-size concurrent changes cannot be detected here.
+                    stage = 'Parse and stage'
+                    records = excel_eav(local_path, source_path, CFG, SHEETS) if suffix == '.xlsx' else csv_eav(local_path, source_path, CFG)
+                    cell_count = stage_eav(records, stage_path)
+                    stage = 'Bronze write'
+                    staged = spark.read.schema(EAV_SCHEMA).parquet(stage_path)
+                    loaded_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    output = bronze_projection(staged, CFG['engine'], loaded_at)
+                    replace_file_slice(output, source_path)
+                    successes.append({'FileName': source_path, 'FilePath': source_path,
+                                      'Layer': 'Bronze', 'Status': 'SUCCESS', 'EAVCells': cell_count})
+            except Exception as exc:
+                entry = {'FileName': source_path, 'Layer': 'Bronze', 'Status': 'FAILED',
+                         'FailedStage': stage, 'ExceptionType': type(exc).__name__}
+                if type(exc) is ValueError:
+                    entry['ExceptionReason'] = str(exc)  # loader's validation messages contain no row values
+                failures.append(entry)
+                try: exception_record(source_path, stage, type(exc).__name__)
+                except Exception as log_error:
+                    entry['ExceptionLogError'] = type(log_error).__name__
+                if CFG['quarantine'] and stage in {'Source validation', 'Parse and stage'}:
+                    try:
+                        # Unique per-run file avoids overwriting existing failed-file copies.
+                        folder = CFG['quarantine'] + '/' + RUN_ID
+                        mssparkutils.fs.mkdirs(folder)
+                        target = folder + '/' + hashlib.sha256(source_path.encode()).hexdigest() + suffix
+                        if mssparkutils.fs.cp(source_path, target, False) is False: raise IOError('Quarantine copy failed')
+                        entry['QuarantineCopy'] = target
+                    except Exception as quarantine_error:
+                        entry['QuarantineCopyError'] = type(quarantine_error).__name__
+            finally:
+                try:
+                    if mssparkutils.fs.exists(stage_path):
+                        if mssparkutils.fs.rm(stage_path, True) is False: raise IOError('Staging cleanup failed')
+                except Exception as cleanup_error:
+                    warnings.append({'Stage': 'Cleanup', 'RunId': RUN_ID, 'Type': type(cleanup_error).__name__})
+        if not successes and not failures:
+            if boolean(p_empty_folder_is_error):
+                failures.append({'Layer': 'Bronze', 'Status': 'FAILED', 'ExceptionReason': 'No supported files found'})
+            else:
+                warnings.append({'Status': 'NO_INPUT', 'SourceFolder': CFG['source']})
+        if successes and boolean(p_run_optimize):
+            try: spark.sql('OPTIMIZE ' + table_id(CFG['target']))
+            except Exception as optimize_error:
+                failures.append({'Layer':'Bronze', 'Status':'FAILED', 'FailedStage':'OPTIMIZE',
+                                 'ExceptionType': type(optimize_error).__name__})
+    except Exception as setup_error:
+        failures.append({'Layer': 'Bronze', 'Status': 'FAILED', 'FailedStage': 'Setup',
+                         'ExceptionType': type(setup_error).__name__})
+    for entries in [successes, failures, skipped, warnings]:
+        for entry in entries:
+            entry['Client'] = route['client']
+            entry['TargetTable'] = route['target_table']
+    return successes, failures, skipped, warnings
+
+all_successes, all_failures, all_skipped, all_warnings = [], [], [], []
+for route in ROUTES:
+    try:
+        successes, failures, skipped, warnings = process_client(route)
+        all_successes.extend(successes); all_failures.extend(failures)
+        all_skipped.extend(skipped); all_warnings.extend(warnings)
+    except Exception as route_error:
+        all_failures.append({'Client':route['client'], 'TargetTable':route['target_table'],
+                             'Status':'FAILED', 'FailedStage':'Client setup',
+                             'ExceptionType':type(route_error).__name__})
+if not all_successes and not all_failures:
+    all_failures.append({'Status':'FAILED', 'ExceptionReason':'No supported files were ingested from selected clients'})
+result = {'exit_value':bool(all_successes) and not all_failures,
+          'exit_message':all_successes + all_failures, 'skipped':all_skipped,
+          'warnings':all_warnings, 'run_id':RUN_ID}
+print(json.dumps(result, default=str))
+
+
+cell-7
+if not result['exit_value'] and boolean(p_fail_on_error):
+    raise RuntimeError('Bronze ingestion failed; inspect the printed run metadata and exception table')
+if boolean(p_return_json):
+    mssparkutils.notebook.exit(json.dumps(result, default=str))
+
