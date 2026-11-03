@@ -1,0 +1,456 @@
+p_filepath = ""
+source_received_root = "Files/adlsascl_gpo/requests/received"
+received_folder_path = "Files/LH_gpo/Received"
+exceptions_folder_path = "Files/LH_gpo/Exceptions"
+Documents_folder_path = "Files/Documents"
+target_table_name = "Bronze.tbl_ClaimsRawData"
+exception_table_name = "Metadata.tbl_FileExceptions"
+allow_multiple_sheets = False
+debug_on = True
+run_optimize = True  
+
+
+# Screenshot 2: imports; cropped type imports completed.
+import csv
+import gc
+import json
+from datetime import date, datetime
+import time
+import re
+import os
+import tempfile
+from pathlib import Path
+from notebookutils import mssparkutils
+import openpyxl
+from pyspark.sql import functions as F
+from pyspark.sql.types import (
+    LongType, StringType, BooleanType, TimestampType, StructType, StructField
+
+
+
+
+def align_and_write_delta(df, target_table_name: str, max_retries: int = 3,
+                          retry_delay_sec: int = 2):
+    try:
+        if spark.catalog.tableExists(target_table_name):
+            target_schema = spark.table(target_table_name).schema
+            source_cols = {col.lower(): col for col in df.columns}
+            if len(source_cols) != len(df.columns):
+                raise ValueError("Source contains case-insensitive duplicate columns")
+            select_exprs = []
+            for field in target_schema.fields:
+                actual = source_cols.get(field.name.lower())
+                if actual is not None:
+                    escaped = actual.replace("`", "``")
+                    select_exprs.append(F.col(f"`{escaped}`").cast(field.dataType).alias(field.name))
+                elif field.nullable:
+                    select_exprs.append(F.lit(None).cast(field.dataType).alias(field.name))
+                else:
+                    raise ValueError(f"Non-nullable target column '{field.name}' is missing")
+            # RECONSTRUCTED: prevent accidental loss of new metadata columns.
+            target_cols = {f.name.lower() for f in target_schema.fields}
+            extra = set(source_cols) - target_cols
+            if extra:
+                raise ValueError(f"Target schema is missing source columns: {sorted(extra)}")
+            aligned_df = df.select(*select_exprs)
+        else:
+            aligned_df = df
+    except Exception as align_err:
+        raise ValueError(f"Schema resolution failure for table '{target_table_name}': {align_err}") from align_err
+    if max_retries < 1:
+        raise ValueError("max_retries must be at least 1")
+    for attempt in range(max_retries):
+        try:
+            aligned_df.write.format("delta").mode("append").saveAsTable(target_table_name)
+            return
+        except Exception as write_err:
+            text = str(write_err).lower()
+            conflict = any(x in text for x in (
+                "concurrentappendexception", "concurrentwriteexception",
+                "concurrentdelete", "metadatachangedexception", "protocolchangedexception"
+            ))
+            if not conflict or attempt == max_retries - 1:
+                raise
+            time.sleep(retry_delay_sec * (attempt + 1))
+
+
+
+def resolve_input_path(value):
+    if value is None or not str(value).strip() or str(value).strip().lower() == "null":
+        raise ValueError("Parameter 'p_filepath' is null, empty, or not received.")
+    parsed = value
+    for _ in range(2):
+        if not isinstance(parsed, str):
+            break
+        try:
+            parsed = json.loads(parsed.strip())
+        except (json.JSONDecodeError, ValueError):
+            break
+    if isinstance(parsed, dict):
+        values = [v for v in parsed.values() if isinstance(v, str)
+                  and "requests/received" in v.replace("\\", "/").lower()]
+        if len(values) != 1:
+            raise ValueError("JSON must contain exactly one requests/received path value")
+        candidate_path = values[0]
+    elif isinstance(parsed, str):
+        candidate_path = parsed
+    else:
+        raise ValueError("Expected a path string or JSON object")
+    candidate_path = candidate_path.strip().replace("\\", "/")
+    pattern = r"(?:^|/)requests/received/(?P<date>\d{4}-\d{2}-\d{2})/(?P<org_id>[^/]+)/(?P<file_name>[^/]+)$"
+    match = re.search(pattern, candidate_path, re.IGNORECASE)
+    if not match:
+        raise ValueError(f"Path structure does not match expected pattern: {candidate_path}")
+    extracted_date, extracted_org_id, file_name = (
+        match.group("date"), match.group("org_id"), match.group("file_name")
+    )
+    datetime.strptime(extracted_date, "%Y-%m-%d")
+    if extracted_org_id in (".", "..") or file_name in (".", ".."):
+        raise ValueError("Invalid relative path segment")
+    if not file_name.lower().endswith((".xlsx", ".csv", ".txt")):
+        raise ValueError(f"Unsupported file extension: {file_name}")
+    return extracted_date, extracted_org_id, file_name
+
+exit_value = False
+exit_message = []
+quarantined_files = []
+successful_files_meta = []
+successful_ingestions = 0
+spark.conf.set("spark.sql.caseSensitive", "true")
+# RECONSTRUCTED: schema creation is needed for new Lakehouses.
+# The configured table names use schema.table; enable Lakehouse schemas first.
+for table in (target_table_name, exception_table_name):
+    parts = table.split(".")
+    if len(parts) == 2:
+        schema_name = parts[0].replace("`", "``")
+        spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{schema_name}`")
+
+
+schema_eav = StructType([
+    StructField("FileName", StringType(), True),
+    StructField("SheetName", StringType(), True),
+    StructField("ColumnPlaceholder", StringType(), True),
+    StructField("RawColumnName", StringType(), True),
+    StructField("ColumnDataType", StringType(), True),
+    StructField("Value", StringType(), True),
+    StructField("RowNumber", LongType(), True),
+])
+exception_schema = StructType([
+    StructField("FileName", StringType(), True),
+    StructField("FilePath", StringType(), True),
+    StructField("ExceptionReason", StringType(), True),
+    StructField("FailedStage", StringType(), True),
+    StructField("LoggedDate", TimestampType(), True),
+    StructField("FieldName", StringType(), True),
+    StructField("Layer", StringType(), True),
+])
+
+def log_and_quarantine_exception(file_path: str, file_name: str, stage: str,
+                                 error_msg: str, field_name=None, layer="Bronze"):
+    quarantined_files.append(file_name)
+    print(f"[EXCEPTION] Quarantining file: {file_name} | Stage: {stage} | Error: {error_msg}")
+    err_df = spark.createDataFrame([
+        (file_name, file_path, str(error_msg), stage, datetime.now(), field_name, layer)
+    ], exception_schema)
+    # Persist the exception before moving its source.
+    align_and_write_delta(err_df, exception_table_name)
+    # RECONSTRUCTED: retain date/org subfolders and never overwrite another file.
+    quarantine_dir = f"{exceptions_folder_path}/{extracted_date}/{extracted_org_id}"
+    mssparkutils.fs.mkdirs(quarantine_dir)
+    target_path = f"{quarantine_dir}/{file_name}"
+    if mssparkutils.fs.exists(target_path):
+        target_path = f"{quarantine_dir}/{datetime.now().strftime('%Y%m%d%H%M%S%f')}_{file_name}"
+    active_path = received_file_path if mssparkutils.fs.exists(received_file_path) else file_path
+    if mssparkutils.fs.exists(active_path):
+        mssparkutils.fs.mv(active_path, target_path, True, False)
+    else:
+        raise FileNotFoundError(f"Cannot quarantine missing source: {active_path}")
+
+
+def validate_file_structure(records, has_headers: bool, is_empty: bool, file_is_empty: bool = False):
+    if is_empty or file_is_empty:
+        return False, "File or sheet is empty."
+    if not has_headers:
+        return False, "File contains data rows but no column headers."
+    if not records:
+        return False, "File or sheet contains headers but no data rows."
+    distinct_headers = {r[3] for r in records}
+    if not distinct_headers or all(re.fullmatch(r"Column_\d+(?:_\d+)?", h) for h in distinct_headers):
+        return False, "File contains data rows but no valid column headers."
+    return True, None
+
+def detect_data_type(val) -> str:
+    if val is None or val == "":
+        return "Null"
+    if isinstance(val, bool):
+        return "Boolean"
+    if isinstance(val, int):
+        return "Integer"
+    if isinstance(val, float):
+        return "Float"
+    if isinstance(val, (datetime, date)):
+        return "Timestamp"
+    return "String"
+
+# RECONSTRUCTED: handles name collisions such as A, A, A_1.
+def unique_headers(row):
+    headers, used = [], set()
+    for i, cell in enumerate(row, start=1):
+        base = str(cell).strip() if cell is not None and str(cell).strip() else f"Column_{i}"
+        header, suffix = base, 0
+        while header in used:
+            suffix += 1
+            header = f"{base}_{suffix}"
+        headers.append(header)
+        used.add(header)
+    return headers
+
+
+def generate_excel_eav(local_file_path: str, sheet_name: str, file_name: str):
+    wb = openpyxl.load_workbook(local_file_path, read_only=True, data_only=True)
+    try:
+        sheet = wb[sheet_name]
+        headers = []
+        row_num = 0
+        for row in sheet.iter_rows(values_only=True):
+            if not row or not any(v is not None and str(v).strip() for v in row):
+                continue
+            if not headers:
+                headers = unique_headers(row)
+                continue
+            row_num += 1
+            # Excel read-only sheets commonly pad all rows to the sheet width.
+            if len(row) > len(headers):
+                raise ValueError(f"Row {row_num} contains more cells than headers")
+            padded_row = tuple(row) + (None,) * (len(headers) - len(row))
+            for col_idx, (col_name, cell_val) in enumerate(zip(headers, padded_row), start=1):
+                yield (
+                    file_name, sheet_name, f"C{col_idx}", col_name,
+                    detect_data_type(cell_val),
+                    str(cell_val) if cell_val is not None else None,
+                    int(row_num), True, False,
+                )
+    finally:
+        wb.close()
+
+
+def generate_csv_eav(local_file_path: str, file_name: str):
+    sheet_name = "CSV_DEFAULT"
+    headers = []
+    row_num = 0
+    with open(local_file_path, mode="r", encoding="utf-8-sig", newline="") as csv_file:
+        reader = csv.reader(csv_file, strict=True)
+        for row in reader:
+            if not row or not any(field.strip() for field in row):
+                continue
+            if not headers:
+                headers = unique_headers(row)
+                continue
+            row_num += 1
+            if len(row) > len(headers):
+                raise ValueError(f"Row {row_num} contains more cells than headers")
+            padded_row = row + [None] * (len(headers) - len(row))
+            for col_idx, (col_name, cell_val) in enumerate(zip(headers, padded_row), start=1):
+                val_cleaned = cell_val.strip() if cell_val is not None else None
+                col_data_type = "Null" if val_cleaned in (None, "") else "String"
+                yield (
+                    file_name, sheet_name, f"C{col_idx}", col_name,
+                    col_data_type, val_cleaned, int(row_num), True, False,
+                )
+
+def input_has_data(local_file_path, sheet_name=None):
+    if sheet_name is None:
+        with open(local_file_path, mode="r", encoding="utf-8-sig") as f_check:
+            return any(line.strip() for line in f_check)
+    wb_check = openpyxl.load_workbook(local_file_path, read_only=True, data_only=True)
+    try:
+        return any(
+            any(cell is not None and str(cell).strip() != "" for cell in row)
+            for row in wb_check[sheet_name].iter_rows(values_only=True)
+        )
+    finally:
+        wb_check.close()
+
+
+def ingest_records(raw_yielded, local_file_path, sheet_name, file_path, current_name):
+    global successful_ingestions
+    if raw_yielded:
+        file_records = [r[:7] for r in raw_yielded]
+        has_headers = raw_yielded[0][7]
+        is_empty = False
+    else:
+        file_records = []
+        has_headers = input_has_data(local_file_path, sheet_name)
+        is_empty = not has_headers
+    is_valid, validation_err = validate_file_structure(
+        file_records, has_headers, is_empty, file_is_empty=is_empty
+    )
+    if not is_valid:
+        detail = f"Sheet '{sheet_name}': {validation_err}" if sheet_name else validation_err
+        raise ValueError(detail)
+    df_file = spark.createDataFrame(file_records, schema=schema_eav)
+    df_file = df_file.withColumn("LoadDate", F.current_timestamp())
+    align_and_write_delta(df_file, target_table_name)
+    successful_ingestions += 1  # One CSV or one Excel sheet, as in screenshot 27.
+    successful_files_meta.append({
+        "FileName": str(p_filepath).strip(),
+        "FilePath": file_path,
+        "ExceptionReason": None,
+        "FailedStage": "Ingestion",
+        "LoggedDate": datetime.now().isoformat(),
+        "FieldName": None,
+        "Layer": "Bronze",
+        "Status": "SUCCESS",
+    })
+    if debug_on:
+        route = "EXCEL" if sheet_name else "CSV"
+        print(f"[INGESTED {route}] File: '{current_name}' | Sheet: '{sheet_name}'")
+    del file_records, df_file
+    gc.collect()
+
+
+def process_input():
+    global extracted_date, extracted_org_id, file_name, received_file_path, p_filepath
+    extracted_date, extracted_org_id, file_name = resolve_input_path(p_filepath)
+    relative_subpath = f"{extracted_date}/{extracted_org_id}/{file_name}"
+    source_adls_path = f"{source_received_root.rstrip('/')}/{relative_subpath}"
+    received_file_path = f"{received_folder_path.rstrip('/')}/{relative_subpath}"
+    p_filepath = source_adls_path
+    received_target_dir = received_file_path.rsplit("/", 1)[0]
+    mssparkutils.fs.mkdirs(received_target_dir)
+    mssparkutils.fs.mkdirs(exceptions_folder_path)
+    if not mssparkutils.fs.exists(source_adls_path):
+        raise FileNotFoundError(source_adls_path)
+    # RECONSTRUCTED: retain the existing-copy check from the earlier reconstruction.
+    if mssparkutils.fs.exists(received_file_path):
+        raise FileExistsError(f"Received copy already exists; reconcile before retry: {received_file_path}")
+    mssparkutils.fs.cp(source_adls_path, received_file_path, False)
+    incoming_files = [f for f in mssparkutils.fs.ls(received_target_dir) if f.name == file_name]
+    if not incoming_files:
+        # RECONSTRUCTED correction: report missing expected file as failure.
+        raise FileNotFoundError("No supported Excel or CSV files found to process.")
+    for file_info in incoming_files:
+        file_path = file_info.path
+        current_name = file_info.name
+        stage = "File Validation"
+        try:
+            if file_info.size == 0:
+                raise ValueError("File is 0 bytes / empty.")
+            # /lakehouse/default/Files path assumption.
+            with tempfile.TemporaryDirectory(prefix="bronze_eav_") as temp_dir:
+                local_file_path = str(Path(temp_dir) / current_name)
+                stage = "Local File Copy"
+                mssparkutils.fs.cp(file_path, Path(local_file_path).as_uri(), False)
+                file_name_lower = current_name.lower()
+                if file_name_lower.endswith((".csv", ".txt")):
+                    stage = "Data Validation"
+                    raw_yielded = list(generate_csv_eav(local_file_path, str(p_filepath).strip()))
+                    ingest_records(raw_yielded, local_file_path, None, file_path, current_name)
+                    del raw_yielded
+                elif file_name_lower.endswith(".xlsx"):
+                    stage = "Sheet Validation"
+                    wb = openpyxl.load_workbook(local_file_path, read_only=True)
+                    try:
+                        sheets = list(wb.sheetnames)
+                    finally:
+                        wb.close()
+                    if not sheets:
+                        raise ValueError("Workbook contains no sheets")
+                    if len(sheets) > 1 and not allow_multiple_sheets:
+                        raise ValueError(
+                            f"Multiple sheets found ({len(sheets)}): {sheets} but allow_multiple_sheets is False."
+                        )
+                    sheets_to_process = sheets if allow_multiple_sheets else [sheets[0]]
+                    for sheet_name in sheets_to_process:
+                        stage = "Data Validation"
+                        raw_yielded = list(generate_excel_eav(
+                            local_file_path, sheet_name, str(p_filepath).strip()
+                        ))
+                        # do not continue reading a file already moved to quarantine.
+                        ingest_records(raw_yielded, local_file_path, sheet_name, file_path, current_name)
+                        del raw_yielded
+                else:
+                    raise ValueError(f"Unsupported file extension: {current_name}")
+        except Exception as exc:
+            exit_message.append(f"{current_name} | {stage} | {exc}")
+            try:
+                log_and_quarantine_exception(file_path, current_name, stage, str(exc))
+            except Exception as quarantine_error:
+                exit_message.append(f"Exception logging/quarantine failed: {quarantine_error}")
+        finally:
+            gc.collect()
+
+
+try:
+    process_input()
+    if successful_ingestions > 0 and run_optimize:
+        print(f"[OPTIMIZING] Running Delta OPTIMIZE on {target_table_name} for Fabric V-Order compaction...")
+        # RECONSTRUCTED: quote identifier components. OPTIMIZE compacts files;
+        # V-Order application depends on the workspace/runtime configuration.
+        quoted_table = ".".join("`" + part.replace("`", "``") + "`" for part in target_table_name.split("."))
+        spark.sql(f"OPTIMIZE {quoted_table}")
+        print(f"[COMPLETED] Ingestion complete. Total files/sheets processed: {successful_ingestions}")
+except Exception as exc:
+    exit_message.append(str(exc))
+
+processing_errors = list(exit_message)
+exit_value = not quarantined_files and not processing_errors and successful_ingestions > 0
+if exit_value:
+    exit_message = successful_files_meta
+else:
+    exit_message = []
+    if quarantined_files:
+        try:
+            exception_rows = spark.table(exception_table_name).where(
+                F.col("FileName").isin(list(dict.fromkeys(quarantined_files)))
+            )
+            columns = ["FileName", "FilePath", "ExceptionReason", "FailedStage",
+                       "LoggedDate", "FieldName", "Layer"]
+            latest = (exception_rows.where(F.col("FailedStage") != "Silver Exclusions")
+                      .orderBy(F.col("LoggedDate").desc()).limit(1))
+            exit_message = [row.asDict() for row in latest.select(*columns).collect()]
+            if not exit_message:
+                fallback = exception_rows.orderBy(F.col("LoggedDate").desc()).limit(1)
+                exit_message = [row.asDict() for row in fallback.select(*columns).collect()]
+        except Exception as lookup_error:
+            processing_errors.append(f"Exception lookup failed: {lookup_error}")
+    # RECONSTRUCTED: preserve setup, logging, and OPTIMIZE errors in the result.
+    if processing_errors:
+        exit_message.append({"Layer": "Bronze", "Status": "FAILED",
+                             "ExceptionReason": "; ".join(processing_errors)})
+    if not exit_message:
+        exit_message = [{"Layer": "Bronze", "Status": "FAILED",
+                         "ExceptionReason": "No file or sheet was ingested."}]
+result = {"exit_value": bool(exit_value), "exit_message": exit_message}
+if debug_on:
+    print(json.dumps(result, default=str))
+mssparkutils.notebook.exit(json.dumps(result, default=str))
+
+
+def report_migration_results(summary_logs):
+    report_columns = ["Schema", "TableName", "Mode", "Status", "Details"]
+    rows = [tuple(None if entry.get(k) is None else str(entry[k])
+                  for k in report_columns) for entry in summary_logs]
+    summary_df = spark.createDataFrame(
+        rows,
+        schema="Schema string, TableName string, Mode string, Status string, Details string",
+    )
+    print("=" * 80)
+    print(f"MIGRATION EXECUTION REPORT - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 80)
+    if rows:
+        summary_df.show(len(rows), truncate=False)
+    else:
+        print("No migration operations were recorded.")
+    total_count = len(summary_logs)
+    success_count = sum(1 for entry in summary_logs if entry.get("Status") == "SUCCESS")
+    failure_count = sum(1 for entry in summary_logs if entry.get("Status") == "FAILED")
+    print(f"Total: {total_count} | SUCCESS: {success_count} | FAILED: {failure_count}")
+    return summary_df
+
+
+
+
+
+
+)
