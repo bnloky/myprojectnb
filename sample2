@@ -1,0 +1,37 @@
+from pyspark.sql import functions as F
+
+# Source folders and destination tables
+sources = [
+    ("Files/CBG_Claims", "bronze_CBG_Claims_raw_table"),
+    ("Files/AMPS_claims", "bronze_AMPS_Claims_raw_table")
+]
+
+for source_folder, target_table in sources:
+
+    # Read text files: each line becomes one row.
+    raw_df = (
+        spark.read
+        .option("pathGlobFilter", "*.txt")
+        .text(source_folder)
+        .withColumnRenamed("value", "raw_text")
+        .withColumn("source_file", F.input_file_name())
+        .withColumn("ingestion_timestamp", F.current_timestamp())
+    )
+
+    # Write a separate Bronze Delta table.
+    (
+        raw_df.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(target_table)
+    )
+
+
+
+    cell-2
+    display(spark.table("bronze_CBG_Claims_raw_table").limit(10))
+
+display(spark.table("bronze_AMPS_Claims_raw_table").limit(10))
+
+    print(f"Successfully loaded: {target_table}")
