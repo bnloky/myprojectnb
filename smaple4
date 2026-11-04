@@ -1,0 +1,189 @@
+from functools import reduce
+from delta.tables import DeltaTable
+from pyspark.sql import functions as F
+
+SOURCE_TABLES = {
+    "Files/CBG_claims/": "Bronze.CBG_Claims_RawData",
+    "Files/AMPS_Claims/": "Bronze.AMPS_Claims_RawData",
+}
+
+spark.sql("CREATE SCHEMA IF NOT EXISTS Bronze")
+
+
+def ingest_to_bronze(source_path: str, target_table: str) -> None:
+
+    # 1. Read pipe-delimited TXT files using their first row as headers.
+    df = (
+        spark.read
+        .format("csv")
+        .option("delimiter", "|")
+        .option("header", "true")
+        .option("inferSchema", "true")
+        .option("enforceSchema", "false")
+        .option("pathGlobFilter", "*.txt")
+        .option("mode", "FAILFAST")
+        .load(source_path)
+    )
+
+    if any(c.lower() == "loaddate" for c in df.columns):
+        raise ValueError("Source already contains a LoadDate column.")
+
+    source_columns = df.columns
+
+    # 2. Remove duplicate source rows before adding the timestamp.
+    df = df.dropDuplicates(source_columns)
+    df = df.withColumn("LoadDate", F.current_timestamp())
+
+    # 3. First run: create the Delta table with unique records.
+    if not spark.catalog.tableExists(target_table):
+        df.write.format("delta").mode("append").saveAsTable(target_table)
+
+    else:
+        # 4. Compare every source column, excluding LoadDate.
+        # Null-safe equality treats NULL and NULL as matching values.
+        def column_ref(alias, name):
+            escaped = name.replace("`", "``")
+            return F.col(f"{alias}.`{escaped}`")
+
+        match_condition = reduce(
+            lambda left, right: left & right,
+            [
+                column_ref("target", c).eqNullSafe(column_ref("source", c))
+                for c in source_columns
+            ],
+        )
+
+        # 5. Insert only rows that do not already exist.
+        (
+            DeltaTable.forName(spark, target_table)
+            .alias("target")
+            .merge(df.alias("source"), match_condition)
+            .whenNotMatchedInsertAll()
+            .execute()
+        )
+
+    print(f"Completed: {source_path} → {target_table}")
+
+
+for source_path, target_table in SOURCE_TABLES.items():
+    ingest_to_bronze(source_path, target_table)
+
+
+
+
+########################################################33########################################################################
+
+
+
+
+
+# Read all supported files directly from each client's folder.
+source_tables = [
+    {
+        "source_path": "Files/CBG_claims/",
+        "target_table": "Bronze.CBG_Claims_RawData",
+        "delimiter": "|",
+    },
+    {
+        "source_path": "Files/AMPS_Claims/",
+        "target_table": "Bronze.AMPS_Claims_RawData",
+        "delimiter": "|",
+    },
+]
+file_pattern = "*.{txt,csv}"
+infer_schema = True
+
+
+
+################
+from functools import reduce
+from delta.tables import DeltaTable
+from pyspark.sql import functions as F
+
+spark.sql("CREATE SCHEMA IF NOT EXISTS Bronze")
+
+
+#############
+def read_claim_files(source_path: str, delimiter: str):
+    # Use Spark's delimited-text reader for both TXT and CSV extensions.
+    df = (
+        spark.read.format("csv")
+        .option("delimiter", delimiter)
+        .option("header", "true")
+        .option("inferSchema", str(infer_schema).lower())
+        .option("enforceSchema", "false")
+        .option("pathGlobFilter", file_pattern)
+        .option("mode", "FAILFAST")
+        .load(source_path)
+    )
+
+    # Keep source headers; reserve LoadDate for ingestion metadata.
+    if not df.columns:
+        raise ValueError(f"No source columns found in {source_path}")
+    if len({c.lower() for c in df.columns}) != len(df.columns):
+        raise ValueError(f"Duplicate column names in {source_path}")
+    if any(c.lower() == "loaddate" for c in df.columns):
+        raise ValueError(f"Source already contains LoadDate: {source_path}")
+    return df
+
+
+def quoted_column(alias: str, name: str):
+    # Quote source headers safely, including headers containing dots/backticks.
+    escaped = name.replace("`", "``")
+    return F.col(f"{alias}.`{escaped}`")
+
+
+def write_unique_delta(df, target_table_name: str):
+    source_columns = df.columns
+
+    # Deduplicate before adding the ingestion timestamp.
+    df = df.dropDuplicates(source_columns)
+    df = df.withColumn("LoadDate", F.current_timestamp())
+
+    if not spark.catalog.tableExists(target_table_name):
+        # First run creates the Delta table from source columns.
+        df.write.format("delta").mode("append").saveAsTable(target_table_name)
+        return
+
+    # Require stable names/types so MERGE cannot change duplicate comparison
+    # through implicit type conversions. Column order may differ in the target.
+    target_schema = spark.table(target_table_name).schema
+    incoming_types = {f.name: f.dataType for f in df.schema.fields}
+    target_types = {f.name: f.dataType for f in target_schema.fields}
+    if incoming_types != target_types:
+        raise ValueError(
+            f"Schema mismatch for {target_table_name}. "
+            "Check source headers and inferred types against the existing table."
+        )
+
+    # Match every source value, excluding the changing LoadDate timestamp.
+    match_condition = reduce(
+        lambda left, right: left & right,
+        [quoted_column("target", c).eqNullSafe(quoted_column("source", c))
+         for c in source_columns],
+    )
+
+    # Matching records remain untouched; only new records are inserted.
+    (
+        DeltaTable.forName(spark, target_table_name)
+        .alias("target")
+        .merge(df.alias("source"), match_condition)
+        .whenNotMatchedInsertAll()
+        .execute()
+    )
+
+
+##################
+completed_tables = []
+
+for config in source_tables:
+    source_path = config["source_path"]
+    target_table_name = config["target_table"]
+
+    df_file = read_claim_files(source_path, config["delimiter"])
+    write_unique_delta(df_file, target_table_name)
+
+    completed_tables.append(target_table_name)
+    print(f"[COMPLETED] {source_path} -> {target_table_name}")
+
+print(f"Bronze load finished. Tables processed: {len(completed_tables)}")
