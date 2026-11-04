@@ -1,0 +1,5 @@
+Bronze Layer Notebook:
+- Dynamic & Metadata-Driven: Design the notebook to accept parameters dynamically (source file path, file format, delimiter, target catalog, schema, and table name).
+- File Format Restriction: Support standard flat files (.csv, .txt, .dat) and explicitly avoid or reject Excel (.xlsx) files.
+- Fail-Fast Schema Validation: Before loading data into the Bronze table, inspect the source file schema and validate that all mandatory required columns exist. If any required column is missing, fail the execution immediately and raise a clear error to catch structural issues early.
+- Comprehensive Ingestion: Pull in all fields from the source dataset into the Bronze Delta table without any early filtering or column truncation to preserve an exact raw representation.
