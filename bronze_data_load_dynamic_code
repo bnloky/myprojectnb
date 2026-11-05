@@ -1,0 +1,25 @@
+Approach 1: Naming Convention-Based (If folder structures are uniform)
+
+# Mark this as a Fabric parameter cell
+p_client_name = "gpo"  # e.g., passed dynamically from ADF or Fabric Pipeline p_client_name parameter
+
+# Dynamically constructed paths using the client name variable
+source_received_root = f"Files/adlsascl_{p_client_name}/requests/received"
+received_folder_path = f"Files/LH_{p_client_name}/Received"
+exceptions_folder_path = f"Files/LH_{p_client_name}/Exceptions"
+Documents_folder_path = "Files/Documents"
+
+# Dynamically constructed target Delta table names (multi-tenant schema/table naming)
+target_table_name = f"Bronze.tbl_ClaimsRawData_{p_client_name}"
+exception_table_name = f"Metadata.tbl_FileExceptions_{p_client_name}"
+
+# Execution controls
+allow_multiple_sheets = False
+debug_on = True
+run_optimize = True
+
+############
+
+
+
+
