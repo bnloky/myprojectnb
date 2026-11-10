@@ -1,0 +1,337 @@
+
+##Pipeline parameters and configuration
+# Fabric parameter cell
+p_filepath = ""                 # Example: Files/landing/CBG/2026-11-10/claims.csv
+p_client_id = ""                # Example: CBG or AMPS
+p_source_version = ""           # Optional: blob version ID / ETag for audit
+p_delimiter = "auto"            # auto, comma, pipe, tab, semicolon
+p_encoding = "utf-8-sig"
+p_effective_at = ""             # Optional ISO 8601 UTC event time; blank = processing UTC time
+p_max_file_mb = 200             # Driver-based parsing safety limit; tune to capacity
+p_debug = True
+
+BRONZE_TABLE = "Bronze.tbl_ClaimsRawDataVersioned"
+CONTROL_TABLE = "Metadata.tbl_FileProcessingControl"
+EXCEPTION_TABLE = "Metadata.tbl_FileExceptions"
+ARCHIVE_ROOT = "Files/LH_gpo/ReceivedVersioned"
+QUARANTINE_ROOT = "Files/LH_gpo/Exceptions"
+
+
+##Imports and helper utilities
+import csv, hashlib, json, os, re, tempfile, shutil, uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlsplit
+import pandas as pd
+from notebookutils import mssparkutils
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
+
+spark.conf.set("spark.sql.session.timeZone", "UTC")
+
+def utc_now():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+def safe_component(value):
+    v = str(value).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", v):
+        raise ValueError("Client ID must contain only letters, numbers, underscore or hyphen")
+    return v
+
+def normalized_path(path):
+    p = str(path or "").strip()
+    if not p or ".." in p.replace("\\", "/").split("/"):
+        raise ValueError("Invalid or missing p_filepath")
+    if not (p.startswith("Files/") or p.startswith("abfss://")):
+        raise ValueError("Provide a Lakehouse Files path or an abfss:// path")
+    return p
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def deterministic_id(*values):
+    return hashlib.sha256(json.dumps(values, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+
+def event_time(value):
+    if not str(value).strip():
+        return utc_now()
+    dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        raise ValueError("p_effective_at must include a timezone, e.g. +00:00 or Z")
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+##Create Delta schemas and tables
+spark.sql("CREATE DATABASE IF NOT EXISTS Bronze")
+spark.sql("CREATE DATABASE IF NOT EXISTS Metadata")
+
+spark.sql(f"""CREATE TABLE IF NOT EXISTS {BRONZE_TABLE} (
+  FileRecordId STRING, FileVersionId STRING, ClientId STRING,
+  SourcePath STRING, FileName STRING, ContentSHA256 STRING,
+  SourceVersion STRING, SheetName STRING, RowNumber BIGINT,
+  ColumnPosition INT, ColumnPlaceholder STRING, RawColumnName STRING,
+  ColumnDataType STRING, Value STRING, LoadDate TIMESTAMP
+) USING DELTA""")
+
+spark.sql(f"""CREATE TABLE IF NOT EXISTS {CONTROL_TABLE} (
+  FileVersionId STRING, ClientId STRING, SourcePath STRING, FileName STRING,
+  ContentSHA256 STRING, SourceVersion STRING, ArchivePath STRING,
+  ProcessingStatus STRING, ValidFrom TIMESTAMP, ValidTo TIMESTAMP,
+  IsCurrent BOOLEAN, FirstSeenAt TIMESTAMP, CompletedAt TIMESTAMP,
+  RecordCount BIGINT, ErrorMessage STRING
+) USING DELTA""")
+
+spark.sql(f"""CREATE TABLE IF NOT EXISTS {EXCEPTION_TABLE} (
+  RunId STRING, FileVersionId STRING, ClientId STRING, SourcePath STRING,
+  FailedStage STRING, ExceptionReason STRING, LoggedDate TIMESTAMP
+) USING DELTA""")
+
+
+##Reader configuration and flexible headers
+DELIMITERS = {"comma": ",", "pipe": "|", "tab": "\t", "semicolon": ";"}
+
+def select_delimiter(sample, choice):
+    if choice != "auto":
+        if choice not in DELIMITERS:
+            raise ValueError(f"Unsupported delimiter: {choice}")
+        return DELIMITERS[choice]
+    try:
+        return csv.Sniffer().sniff(sample, delimiters=",|\t;").delimiter
+    except csv.Error:
+        return ","
+
+def clean_headers(values):
+    seen = {}
+    output = []
+    for idx, val in enumerate(values, 1):
+        base = str(val).strip() if val is not None else ""
+        base = base or f"UNNAMED_{idx}"
+        key = base.casefold()
+        seen[key] = seen.get(key, 0) + 1
+        output.append(base if seen[key] == 1 else f"{base}__{seen[key]}")
+    return output
+
+def text_rows(path, delimiter_choice, encoding):
+    with open(path, "r", encoding=encoding, newline="") as f:
+        sample = f.read(16384)
+        f.seek(0)
+        reader = csv.reader(f, delimiter=select_delimiter(sample, delimiter_choice), strict=True)
+        headers = None
+        row_no = 0
+        for row in reader:
+            if not row or all(not str(v).strip() for v in row):
+                continue
+            if headers is None:
+                headers = clean_headers(row)
+                continue
+            row_no += 1
+            if len(row) > len(headers):
+                raise ValueError(f"Source row {row_no} has more fields than header")
+            row = row + [None] * (len(headers) - len(row))
+            for pos, (name, val) in enumerate(zip(headers, row), 1):
+                yield row_no, pos, name, "Null" if val is None or val == "" else "String", val
+        if headers is None or row_no == 0:
+            raise ValueError("Source file is blank or contains headers only")
+
+def stata_rows(path):
+    # Stata .dta binary format; iterator/chunksize avoids loading all rows at once.
+    row_no = 0
+    with pd.read_stata(path, chunksize=5000, convert_categoricals=False) as reader:
+        for chunk in reader:
+            headers = clean_headers(chunk.columns)
+            for row in chunk.itertuples(index=False, name=None):
+                row_no += 1
+                for pos, (name, val) in enumerate(zip(headers, row), 1):
+                    if pd.isna(val):
+                        val, dtype = None, "Null"
+                    else:
+                        dtype = type(val).__name__
+                        val = str(val)
+                    yield row_no, pos, name, dtype, val
+    if row_no == 0:
+        raise ValueError("Stata file has no data rows")
+
+def source_cells(path, extension):
+    if extension in (".csv", ".txt"):
+        return text_rows(path, p_delimiter, p_encoding)
+    if extension == ".dta":
+        return stata_rows(path)
+    raise ValueError("Only .txt, .csv, and Stata .dta are allowed; Excel is excluded")
+
+
+##Stage an immutable file and compute SHA-256
+def stage_source(source_path, client_id):
+    ext = Path(urlsplit(source_path).path).suffix.lower()
+    if ext not in {".csv", ".txt", ".dta"}:
+        raise ValueError(f"Unsupported extension {ext}: Excel files are excluded")
+    tempdir = tempfile.mkdtemp(prefix="gpo_bronze_")
+    local = os.path.join(tempdir, f"source{ext}")
+    # notebookutils.fs.cp accepts Lakehouse/OneLake paths and local file: destinations.
+    mssparkutils.fs.cp(source_path, "file:" + local)
+    size_mb = os.path.getsize(local) / (1024 * 1024)
+    if size_mb > float(p_max_file_mb):
+        raise ValueError(f"File is {size_mb:.1f} MB, exceeds p_max_file_mb={p_max_file_mb}")
+    checksum = sha256_file(local)
+    version_id = deterministic_id(client_id, source_path, checksum)
+    archive_path = f"{ARCHIVE_ROOT}/{client_id}/{version_id}/{Path(urlsplit(source_path).path).name}"
+    return tempdir, local, checksum, version_id, archive_path, ext
+
+
+##Control-table lookup and recovery rules
+def control_rows(client_id, source_path):
+    return spark.table(CONTROL_TABLE).where(
+        (F.col("ClientId") == client_id) & (F.col("SourcePath") == source_path)
+    )
+
+def successful_version_exists(file_version_id):
+    return (spark.table(CONTROL_TABLE)
+            .where((F.col("FileVersionId") == file_version_id) &
+                   (F.col("ProcessingStatus") == "SUCCESS"))
+            .limit(1).count() > 0)
+
+def upsert_control(row):
+    # MERGE is idempotent for one writer; it is not a distributed lock.
+    df = spark.createDataFrame([row], schema=spark.table(CONTROL_TABLE).schema)
+    df.createOrReplaceTempView("gpo_control_upsert")
+    spark.sql(f"""MERGE INTO {CONTROL_TABLE} t USING gpo_control_upsert s
+      ON t.FileVersionId = s.FileVersionId
+      WHEN MATCHED THEN UPDATE SET *
+      WHEN NOT MATCHED THEN INSERT *""")
+
+def write_exception(run_id, version_id, client_id, source_path, stage, exc):
+    data = [(run_id, version_id, client_id, source_path, stage, str(exc)[:4000], utc_now())]
+    spark.createDataFrame(data, spark.table(EXCEPTION_TABLE).schema).write.mode("append").saveAsTable(EXCEPTION_TABLE)
+
+
+##EAV Bronze Delta MERGE
+BRONZE_SCHEMA = spark.table(BRONZE_TABLE).schema
+
+def bronze_rows(local_path, ext, client_id, source_path, file_name, version_id, checksum, load_ts):
+    for row_no, pos, col_name, dtype, value in source_cells(local_path, ext):
+        record_id = deterministic_id(version_id, row_no, pos)
+        yield (record_id, version_id, client_id, source_path, file_name, checksum,
+               str(p_source_version or ""), "DTA_DEFAULT" if ext == ".dta" else "TEXT_DEFAULT",
+               int(row_no), int(pos), f"C{pos}", col_name, dtype,
+               None if value is None else str(value), load_ts)
+
+def merge_bronze_batch(rows):
+    if not rows:
+        return
+    df = spark.createDataFrame(rows, schema=BRONZE_SCHEMA)
+    df.createOrReplaceTempView("gpo_bronze_batch")
+    spark.sql(f"""MERGE INTO {BRONZE_TABLE} t USING gpo_bronze_batch s
+      ON t.FileRecordId = s.FileRecordId
+      WHEN NOT MATCHED THEN INSERT *""")
+
+def ingest_version(local_path, ext, client_id, source_path, file_name, version_id, checksum, batch_size=10000):
+    load_ts = utc_now()
+    batch = []
+    count = 0
+    for item in bronze_rows(local_path, ext, client_id, source_path, file_name, version_id, checksum, load_ts):
+        batch.append(item)
+        count += 1
+        if len(batch) >= batch_size:
+            merge_bronze_batch(batch)
+            batch = []
+    merge_bronze_batch(batch)
+    if count == 0:
+        raise ValueError("No EAV cells produced")
+    return count
+
+
+##Effective dating and file version activation
+def activate_file_version(client_id, source_path, version_id, effective_ts):
+    current = (control_rows(client_id, source_path)
+               .where((F.col("IsCurrent") == True) & (F.col("ProcessingStatus") == "SUCCESS"))
+               .select("FileVersionId", "ValidFrom").collect())
+    if len(current) > 1:
+        raise RuntimeError("Multiple current versions exist: reconcile control table")
+    if current and current[0]["FileVersionId"] != version_id:
+        if effective_ts <= current[0]["ValidFrom"]:
+            raise ValueError("Out-of-order file effective timestamp: manual timeline reconciliation required")
+        # Only close a previous version after the new Bronze data is written.
+        spark.sql(f"""UPDATE {CONTROL_TABLE}
+            SET ValidTo = TIMESTAMP '{effective_ts.isoformat(sep=' ')}', IsCurrent = false
+            WHERE ClientId = '{client_id}' AND SourcePath = '{source_path.replace("'", "''")}'
+              AND IsCurrent = true AND ProcessingStatus = 'SUCCESS'
+              AND FileVersionId <> '{version_id}'""")
+
+
+##Main processing orchestration
+def process_bronze():
+    run_id = str(uuid.uuid4())
+    source_path = normalized_path(p_filepath)
+    client_id = safe_component(p_client_id)
+    file_name = Path(urlsplit(source_path).path).name
+    effective_ts = event_time(p_effective_at)
+    tempdir = None
+    version_id = ""
+    stage = "STAGE"
+    try:
+        tempdir, local, checksum, version_id, archive_path, ext = stage_source(source_path, client_id)
+        if successful_version_exists(version_id):
+            return {"exit_value": True, "status": "SKIPPED_DUPLICATE", "file_version_id": version_id,
+                    "client_id": client_id, "source_path": source_path}
+        existing = control_rows(client_id, source_path).where(F.col("FileVersionId") == version_id).collect()
+        first_seen = existing[0]["FirstSeenAt"] if existing else utc_now()
+        stage = "ARCHIVE"
+        archive_dir = archive_path.rsplit("/", 1)[0]
+        mssparkutils.fs.mkdirs(archive_dir)
+        if not mssparkutils.fs.exists(archive_path):
+            mssparkutils.fs.cp("file:" + local, archive_path)
+        stage = "REGISTER"
+        upsert_control((version_id, client_id, source_path, file_name, checksum,
+                        str(p_source_version or ""), archive_path, "STARTED",
+                        effective_ts, None, False, first_seen, None, None, None))
+        stage = "BRONZE_INGEST"
+        record_count = ingest_version(local, ext, client_id, source_path, file_name, version_id, checksum)
+        stage = "EFFECTIVE_DATING"
+        activate_file_version(client_id, source_path, version_id, effective_ts)
+        stage = "COMPLETE"
+        upsert_control((version_id, client_id, source_path, file_name, checksum,
+                        str(p_source_version or ""), archive_path, "SUCCESS",
+                        effective_ts, None, True, first_seen, utc_now(), record_count, None))
+        return {"exit_value": True, "status": "SUCCESS", "file_version_id": version_id,
+                "client_id": client_id, "source_path": source_path,
+                "sha256": checksum, "eav_record_count": record_count}
+    except Exception as exc:
+        if version_id:
+            # Do not overwrite a SUCCESS row with FAILED during a racing duplicate invocation.
+            if not successful_version_exists(version_id):
+                try:
+                    prior = control_rows(client_id, source_path).where(F.col("FileVersionId") == version_id).collect()
+                    if prior:
+                        old = prior[0]
+                        upsert_control((version_id, client_id, source_path, file_name,
+                                        old["ContentSHA256"], old["SourceVersion"], old["ArchivePath"],
+                                        "FAILED", old["ValidFrom"], old["ValidTo"], False,
+                                        old["FirstSeenAt"], None, old["RecordCount"], str(exc)[:4000]))
+                except Exception:
+                    pass
+        try:
+            write_exception(run_id, version_id, client_id, source_path, stage, exc)
+        except Exception as log_exc:
+            print("Exception logging also failed:", log_exc)
+        return {"exit_value": False, "status": "FAILED", "failed_stage": stage,
+                "file_version_id": version_id, "error": str(exc)}
+    finally:
+        if tempdir:
+            shutil.rmtree(tempdir, ignore_errors=True)
+
+##Execute and return a pipeline
+result = process_bronze()
+print(json.dumps(result, default=str, indent=2))
+mssparkutils.notebook.exit(json.dumps(result, default=str))
+
+
+
+
+
+
+
+
+
+
