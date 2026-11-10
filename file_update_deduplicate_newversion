@@ -1,0 +1,130 @@
+###############################
+import hashlib
+from pyspark.sql import functions as F
+
+CONTROL_TABLE = "Metadata.tbl_FileProcessingControl"
+
+def calculate_sha256(local_file_path):
+    sha256 = hashlib.sha256()
+
+    with open(local_file_path, "rb") as f:
+        for chunk in iter(
+            lambda: f.read(1024 * 1024), b""
+        ):
+            sha256.update(chunk)
+
+    return sha256.hexdigest()
+
+
+def check_file_version(source_path, content_hash):
+    history = (
+        spark.table(CONTROL_TABLE)
+        .filter(F.col("SourcePath") == source_path)
+        .filter(F.col("ProcessingStatus") == "SUCCESS")
+    )
+
+    duplicate = (
+        history
+        .filter(F.col("ContentHash") == content_hash)
+        .limit(1)
+        .count() > 0
+    )
+
+    if duplicate:
+        return "SKIP_DUPLICATE"
+
+    if history.limit(1).count() > 0:
+        return "PROCESS_UPDATED_VERSION"
+
+    return "PROCESS_NEW_FILE"
+
+
+## Explanation
+calculate_sha256() calculates a checksum from the file's actual bytes.
+
+check_file_version() searches the Delta control table for previously successful versions of the same source path.
+
+If the content hash already exists, it returns SKIP_DUPLICATE.
+
+If the source path exists but the hash is different, it returns PROCESS_UPDATED_VERSION.
+
+If no previous successful version exists, it returns PROCESS_NEW_FILE.
+
+This example assumes you have already created Metadata.tbl_FileProcessingControl with the required columns. It is detection logic, not a complete concurrency-safe processing framework.
+
+############################################################
+4. How to modify your existing process_input()
+Your existing notebook raises FileExistsError whenever the Received working copy already exists.
+
+Replace that path-only rejection with version-aware processing. The important integration point is after obtaining a stable local copy of the incoming blob version, but before calling ingest_records().
+
+
+# After copying the exact incoming blob version locally:
+
+content_hash = calculate_sha256(local_file_path)
+
+decision = check_file_version(
+    source_adls_path,
+    content_hash
+)
+
+if decision == "SKIP_DUPLICATE":
+    print("Already processed. Skipping duplicate.")
+
+elif decision == "PROCESS_UPDATED_VERSION":
+    print("Updated content detected.")
+    # Process as a new Bronze file version.
+    # Reconcile prior attempts and claim the version first.
+
+elif decision == "PROCESS_NEW_FILE":
+    print("New file detected.")
+    # Process the first Bronze file version.
+
+##Do not overwrite the previous working copy blindly. Use a version-specific location such as:
+
+Files/LH_gpo/Received/ORG001/<file_version_id>/claims.csv
+
+The file version ID can be derived from a stable source version identifier or the content hash.
+
+For Azure Blob Storage, enabling blob versioning is particularly useful. Otherwise, an event may refer to an earlier upload while the current blob path already contains newer content.
+
+##############################################################
+5. How to maintain claim history in Silver
+Suppose your Bronze contains both file versions. In Silver, use a business key such as ClaimId to decide which claims changed.
+
+For current-state processing, you can use Delta MERGE:
+
+
+MERGE INTO Silver.Claims AS target
+USING Silver.Claims_Staging AS source
+ON target.ClaimId = source.ClaimId
+
+WHEN MATCHED AND
+    NOT (target.Amount <=> source.Amount)
+THEN UPDATE SET
+    target.Amount = source.Amount,
+    target.UpdatedAt = source.UpdatedAt
+
+WHEN NOT MATCHED
+THEN INSERT (
+    ClaimId,
+    Amount,
+    UpdatedAt
+)
+VALUES (
+    source.ClaimId,
+    source.Amount,
+    source.UpdatedAt
+);
+
+
+6. Final expected result
+File processing control table
+Version	Hash	Status
+V1	HASH_A	SUCCESS
+V1 retry	HASH_A	SKIPPED
+V2	HASH_B	SUCCESS
+###########################################
+
+
+
