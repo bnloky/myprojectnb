@@ -1,0 +1,575 @@
+# RECOVERED: pipeline base parameter. The example source path is redacted.
+p_filepath = ""
+# RECONSTRUCTED review controls.
+RUN_PIPELINE = False
+ENABLE_WRITES = False
+CONFIGURATION_VERIFIED = False
+DEBUG_ON = True  # Set False for normal runs; avoid printing claims/PII.
+
+
+# RECOVERED: pipeline base parameter. The example source path is redacted.
+p_filepath = ""
+# RECONSTRUCTED review controls.
+RUN_PIPELINE = False
+ENABLE_WRITES = False
+CONFIGURATION_VERIFIED = False
+DEBUG_ON = True  # Set False for normal runs; avoid printing claims/PII.
+
+
+##Configuration and response schemas
+DOC_FOLDER = "Files/lh_gpo/Received/"
+EXC_FOLDER = "Files/lh_gpo/Exceptions/"
+TBL_BRONZE = "Bronze.tbl_ClaimsRawData"
+TBL_INC = "Metadata.tbl_InclusionList"
+TBL_EXC = "Metadata.tbl_ExclusionList"
+TBL_PROMPTS = "Metadata.tbl_GenerativeAIPrompts"
+TBL_AUDIT = "Metadata.tbl_FileAuditTrail"
+TBL_STEWARD = "Metadata.tbl_StewardshipQueue"
+TBL_SILVER = "Silver.tbl_ClaimsCleanedData"
+TBL_PROCESSED = "Metadata.tbl_FilesProcessed"
+TBL_EXCEPTIONS = "Metadata.tbl_FileExceptions"
+MANDATORY_TARGETS = ["NDC", "QUANTITY", "NPI"]
+GENERIC_THRESHOLD = 0.90
+VALIDATION_SCORE = 0.85
+STEWARDSHIP_SCORE = 0.65
+
+# RECONSTRUCTED schema adapters: confirm actual source fields, table spellings.
+BRONZE_COLUMNS = {
+    "FileName": "FileName", "RowNumber": "RowNumber",
+    "RawColumnName": "RawColumnName", "Value": "Value",
+}
+INC_NAME_COL = "InclusionName"
+INC_REFERENCE_COL = "ReferenceName"
+EXC_NAME_COL = "ExclusionName"
+PROMPT_ID_COL = "PromptId"
+PROMPT_TEXT_COL = "PromptText"
+# Visible phases: header normalization, semantic matching, validation, conflict.
+PROMPT_IDS = {"normalization": None, "phase1": None,
+              "validation": None, "phase2": None}
+# Callable contract described in the integration cell below.
+AI_RUNNER = None
+# RECONSTRUCTED data-format contracts: verify against actual claim standards.
+NDC_LENGTHS = (10, 11)
+NPI_LENGTH = 10
+QUANTITY_PATTERN = r"^-?(?:[0-9]+(?:[.][0-9]+)?|[.][0-9]+)$"
+
+
+# RECOVERED JSON response schemas.
+ai_schema_p1 = {
+    "type": "object",
+    "properties": {"FinalColumn": {"type": "string"},
+                   "MatchScore": {"type": "number"}},
+    "required": ["FinalColumn", "MatchScore"], "additionalProperties": False,
+}
+ai_schema_p2 = {
+    "type": "object",
+    "properties": {"SelectedBaseColumn": {"type": "string"},
+                   "Reasoning": {"type": "string"},
+                   "MatchScore": {"type": "number"}},
+    "required": ["SelectedBaseColumn", "MatchScore"],
+    "additionalProperties": False,
+}
+# RECONSTRUCTED from the visible NormalisedColumnName lineage result.
+ai_schema_normalization = {
+    "type": "object",
+    "properties": {"NormalisedColumnName": {"type": "string"}},
+    "required": ["NormalisedColumnName"], "additionalProperties": False,
+}
+
+
+def require_columns(df, names, label):
+    missing = set(names) - set(df.columns)
+    if missing:
+        raise ValueError(f"{label}: missing columns {sorted(missing)}")
+
+
+def parse_input_path(value):
+    if value is None or not str(value).strip():
+        raise ValueError("Parameter p_filepath is empty or not provided")
+    raw = str(value).strip()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        # RECONSTRUCTED: prefer relative key; accept the screenshot's nested value.
+        selected = parsed.get("relative")
+        if not isinstance(selected, str):
+            candidates = [v for v in parsed.values()
+                          if isinstance(v, str) and "relative" in v.lower()]
+            if len(candidates) != 1:
+                raise ValueError("JSON path has no unambiguous relative value")
+            selected = candidates[0]
+        raw = selected
+    path = urllib.parse.unquote(raw)
+    match = re.search(r"(?P<date>\d{4}/\d{2}/\d{2})/gpo/(?P<org>[^/]+)/(?P<file>[^/?#]+)$", path)
+    if not match:
+        raise ValueError("Path must end YYYY/MM/DD/gpo/<org>/<filename>")
+    date = match.group("date")
+    datetime.strptime(date, "%Y/%m/%d")
+    org = match.group("org")
+    filename = match.group("file")
+    return dict(path=path, extracted_date=date, extracted_org_id=org,
+                file_name=filename, bronze_adls_path=f"{date}/gpo/{org}/{filename}")
+
+
+def align_and_write_delta(df, target_table_name, max_retries=3, retry_delay_sec=2):
+    if not ENABLE_WRITES:
+        return  # RECONSTRUCTED: preview mode does not mutate tables.
+    if not spark.catalog.tableExists(target_table_name):
+        raise ValueError(f"Missing approved target table: {target_table_name}")
+    target_schema = spark.table(target_table_name).schema
+    source_cols = {c.lower(): c for c in df.columns}
+    if len(source_cols) != len(df.columns):
+        raise ValueError("Case-insensitive source column collision")
+    select_exprs = []
+    for field in target_schema.fields:
+        actual = source_cols.get(field.name.lower())
+        if actual is not None:
+            select_exprs.append(F.col(actual).cast(field.dataType).alias(field.name))
+        elif field.nullable:
+            select_exprs.append(F.lit(None).cast(field.dataType).alias(field.name))
+        else:
+            raise ValueError(f"Missing non-nullable target field: {field.name}")
+    aligned_df = df.select(*select_exprs)
+    last_exception = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            (aligned_df.write.format("delta").mode("append")
+             .option("mergeSchema", "false").saveAsTable(target_table_name))
+            return
+        except Exception as error:
+            last_exception = error
+            if attempt < max_retries:
+                time.sleep(retry_delay_sec)
+    raise RuntimeError(f"Failed to append to {target_table_name}") from last_exception
+
+
+def normalise_col(df, source_col, target_col):
+    return df.withColumn(target_col, F.lower(F.regexp_replace(
+        F.trim(F.col(source_col)), "[^a-zA-Z0-9]", "")))
+
+
+def log_and_quarantine(file_name, stage, reason, field_name=None):
+    # RECOVERED exception-table row; no physical Blob file move is inferred.
+    schema = "FileName string, FilePath string, ExceptionReason string, FailedStage string, Layer string, FieldName string, LoggedDate timestamp"
+    row = (file_name, str(p_filepath), str(reason), stage, "Silver", field_name,
+           datetime.now(timezone.utc).replace(tzinfo=None))
+    align_and_write_delta(spark.createDataFrame([row], schema), TBL_EXCEPTIONS)
+
+
+def quarantine_and_raise(file_name, stage, reason, field_name=None):
+    quarantined_files.add(file_name)
+    try:
+        log_and_quarantine(file_name, stage, reason, field_name)
+    except Exception as log_error:
+        raise RuntimeError(f"{reason}; exception logging also failed: {log_error}") from log_error
+    raise ValueError(reason)
+
+
+
+def run_fabric_ai(df, prompt, response_schema, output_column):
+    if AI_RUNNER is None or not callable(AI_RUNNER):
+        raise RuntimeError("Configure the approved AI_RUNNER integration")
+    result = AI_RUNNER(df, prompt, response_schema, output_column)
+    require_columns(result, list(df.columns) + [output_column], "AI_RUNNER response")
+    return result
+
+
+def load_prompts():
+    if any(value is None for value in PROMPT_IDS.values()):
+        raise ValueError("Configure the four real metadata prompt IDs")
+    source = spark.table(TBL_PROMPTS)
+    require_columns(source, [PROMPT_ID_COL, PROMPT_TEXT_COL], TBL_PROMPTS)
+    output = {}
+    for phase, identifier in PROMPT_IDS.items():
+        rows = source.filter(F.col(PROMPT_ID_COL) == identifier).select(PROMPT_TEXT_COL).limit(2).collect()
+        if len(rows) != 1 or not rows[0][0]:
+            raise ValueError(f"Expected exactly one nonempty prompt for {phase}")
+        output[phase] = rows[0][0]
+    return output
+
+
+def format_prompt(template, pos_ctx, neg_ctx, is_phase_1=False):
+    text = (template.replace("{pos_context}", pos_ctx)
+            .replace("{neg_context}", neg_ctx)
+            .replace("{mandatory_targets}", str(MANDATORY_TARGETS))
+            .replace("{static_targets_placeholder}", str(MANDATORY_TARGETS)))
+    if is_phase_1:
+        text += "\nEvaluate column {NormalisedColumnName} (Raw header {RawColumnName})"
+    return text
+
+
+def clean_json_text(value):
+    # RECONSTRUCTED markdown-fence cleanup used by integration/unit checks.
+    if not isinstance(value, str):
+        raise ValueError("AI result must be a JSON string")
+    text = value.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+        text = re.sub(r"\s*```$", "", text)
+    return text
+
+
+def parse_ai_object(value, phase):
+    obj = json.loads(clean_json_text(value))
+    if not isinstance(obj, dict):
+        raise ValueError("AI response is not an object")
+    if phase == "normalization":
+        name = obj.get("NormalisedColumnName")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Empty AI header normalization")
+    else:
+        key = "SelectedBaseColumn" if phase == "phase2" else "FinalColumn"
+        if not isinstance(obj.get(key), str):
+            raise ValueError(f"Missing AI {key}")
+        score = obj.get("MatchScore")
+        if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= 1:
+            raise ValueError("AI MatchScore must be between zero and one")
+    return obj
+
+
+
+##Bronze lookup and header normalization
+def load_bronze(file_name):
+    source = spark.table(TBL_BRONZE)
+    require_columns(source, list(BRONZE_COLUMNS.values()), TBL_BRONZE)
+    source = source.select(*[F.col(actual).alias(canonical)
+                             for canonical, actual in BRONZE_COLUMNS.items()])
+    raw = source.filter(F.col("FileName") == file_name)
+    if raw.limit(1).count() == 0:
+        clean = re.sub(r"[^a-z0-9]", "", file_name.lower())
+        if not clean:
+            raise ValueError("Empty normalized filename")
+        raw = source.filter(F.lower(F.regexp_replace(
+            F.col("FileName"), "[^a-zA-Z0-9]", "")).contains(clean))
+    filenames = raw.select("FileName").distinct().limit(2).collect()
+    if len(filenames) == 0:
+        quarantine_and_raise(file_name, "Bronze File Extraction", "No matching Bronze file records")
+    if len(filenames) > 1:
+        quarantine_and_raise(file_name, "Bronze File Extraction", "Ambiguous Bronze filename match")
+    raw = raw.withColumn("RawColumnName", F.trim(F.regexp_replace(
+        F.col("RawColumnName"), r"^[\[\"']+|[\]\"']+$", "")))
+    headers = [r[0] for r in raw.select("RawColumnName").distinct().collect()]
+    if not headers or any(h is None or not h.strip() or re.fullmatch(r"_c[0-9]+", h) for h in headers):
+        quarantine_and_raise(file_name, "Bronze Header Parsing", "Blank/default headers; possible headerless input")
+    if raw.filter(F.col("RowNumber").isNull()).limit(1).count():
+        quarantine_and_raise(file_name, "Bronze Header Parsing", "Null source row identity")
+    return raw.cache()
+
+
+def normalize_headers(raw, prompt, file_name):
+    headers = raw.select("RawColumnName").distinct()
+    result = run_fabric_ai(headers, prompt, ai_schema_normalization, "clean_ai_json")
+    rows = result.select("RawColumnName", "clean_ai_json").collect()
+    mappings = []
+    for row in rows:
+        try:
+            obj = parse_ai_object(row.clean_ai_json, "normalization")
+            mappings.append((row.RawColumnName, obj["NormalisedColumnName"].strip()))
+        except Exception as error:
+            quarantine_and_raise(file_name, "Silver Normalization", str(error), row.RawColumnName)
+    lineage = spark.createDataFrame(mappings, "RawColumnName string, NormalisedColumnName string")
+    # RECONSTRUCTED completeness/cardinality guard.
+    if len(mappings) != headers.count() or lineage.groupBy("RawColumnName").count().filter("count != 1").count():
+        quarantine_and_raise(file_name, "Silver Normalization", "AI header result is missing or duplicated")
+    return lineage.withColumn("FileName", F.lit(file_name)).cache()
+
+
+##File quality and exclusions
+def load_reference_patterns():
+    inc = spark.table(TBL_INC)
+    exc = spark.table(TBL_EXC)
+    require_columns(inc, [INC_NAME_COL, INC_REFERENCE_COL], TBL_INC)
+    require_columns(exc, [EXC_NAME_COL], TBL_EXC)
+    inc = (normalise_col(inc, INC_NAME_COL, "NormalisedInclusion")
+           .select("NormalisedInclusion", F.col(INC_REFERENCE_COL).alias("ReferenceName"))
+           .filter(F.col("NormalisedInclusion").isNotNull() & (F.col("NormalisedInclusion") != "")))
+    exc = (normalise_col(exc, EXC_NAME_COL, "NormalisedExclusion")
+           .select("NormalisedExclusion")
+           .filter(F.col("NormalisedExclusion").isNotNull() & (F.col("NormalisedExclusion") != "")))
+    return inc.distinct(), exc.distinct()
+
+
+def quality_and_exclusions(lineage, inc, exc, file_name):
+    work = normalise_col(lineage, "NormalisedColumnName", "_match_header")
+    # RECONSTRUCTED generic-header expression; screenshot expression is clipped.
+    generic = r"^(?:column|col|field|unnamed|c)[0-9]*$"
+    quality = work.agg(F.avg(F.when(F.col("_match_header").rlike(generic), 1).otherwise(0)).alias("ratio")).first()
+    ratio = quality.ratio or 0.0
+    if ratio >= GENERIC_THRESHOLD:
+        quarantine_and_raise(file_name, "Silver Quality Validation", f"Generic columns exceed threshold ({ratio:.2%})")
+    patterns = [r.NormalisedExclusion for r in exc.collect()]
+    expression = F.lit(False)
+    for pattern in patterns:
+        expression = expression | F.col("_match_header").contains(pattern)
+    excluded = work.filter(expression)
+    rows = excluded.select("RawColumnName", "NormalisedColumnName").collect()
+    if rows:
+        reason = "Columns matched exclusion list and were purposefully ignored: " + ", ".join(r.RawColumnName for r in rows)
+        log_and_quarantine(file_name, "Silver Exclusions", reason)
+    return work.filter(~expression).drop("_match_header").cache()
+
+
+##Deterministic matching
+def empty_matches():
+    return spark.createDataFrame([], "FileName string, RawColumnName string, NormalisedColumnName string, FinalColumn string, MatchScore double")
+
+
+def deterministic_matching(candidates, inc):
+    refs = inc.collect()
+    matches = []
+    for row in candidates.collect():
+        key = re.sub(r"[^a-z0-9]", "", row.NormalisedColumnName.lower())
+        direct = {re.sub(r"[^a-z0-9]", "", t.lower()): t for t in MANDATORY_TARGETS}
+        direct["qty"] = "QUANTITY"
+        target = direct.get(key)
+        if not target:
+            targets = {str(r.ReferenceName).upper() for r in refs
+                       if r.ReferenceName and r.NormalisedInclusion in key}
+            targets = {"QUANTITY" if t == "QTY" else t for t in targets}
+            if len(targets) == 1:
+                target = next(iter(targets))
+        if target:
+            matches.append((row.FileName, row.RawColumnName, row.NormalisedColumnName, target, 1.0))
+    deterministic = spark.createDataFrame(matches, empty_matches().schema)
+    remaining = candidates.join(deterministic.select("FileName", "RawColumnName"),
+                                ["FileName", "RawColumnName"], "left_anti")
+    return deterministic.cache(), remaining.cache()
+
+
+def audit_matches(matches, method, phase, elapsed_ms=0):
+    if matches.limit(1).count() == 0:
+        return
+    # RECOVERED audit aliases; confirm complete target contract in workspace.
+    audit = matches.select(
+        "FileName", "RawColumnName", "NormalisedColumnName", "FinalColumn", "MatchScore",
+        F.lit(method).alias("Prompt"), F.lit(method).alias("MatchMethod"),
+        F.lit(phase).alias("MatchPhase"), F.lit(0).alias("InputTokens"),
+        F.lit(0).alias("CompletionTokens"), F.lit(0).alias("TotalTokens"),
+        F.lit(elapsed_ms).cast("long").alias("ExecutionTimeMs"),
+        F.current_timestamp().alias("Timestamp"))
+    # RECONSTRUCTED: token count zero means unavailable, not measured usage.
+    align_and_write_delta(audit, TBL_AUDIT)
+
+
+##Semantic matching
+def semantic_matching(candidates, prompt, pos_ctx, neg_ctx, file_name):
+    if candidates.limit(1).count() == 0:
+        return empty_matches()
+    started = time.time()
+    result = run_fabric_ai(candidates, format_prompt(prompt, pos_ctx, neg_ctx, True), ai_schema_p1, "clean_ai_json")
+    parsed = []
+    for row in result.select("FileName", "RawColumnName", "NormalisedColumnName", "clean_ai_json").collect():
+        try:
+            obj = parse_ai_object(row.clean_ai_json, "phase1")
+        except Exception as error:
+            quarantine_and_raise(file_name, "Silver AI Matching", str(error), row.RawColumnName)
+        target = obj["FinalColumn"].strip().upper()
+        target = "QUANTITY" if target == "QTY" else target
+        parsed.append((row.FileName, row.RawColumnName, row.NormalisedColumnName,
+                       target, float(obj["MatchScore"])))
+    matches = spark.createDataFrame(parsed, empty_matches().schema)
+    if matches.count() != candidates.count() or matches.groupBy("FileName", "RawColumnName").count().filter("count != 1").count():
+        quarantine_and_raise(file_name, "Silver AI Matching", "AI output cardinality mismatch")
+    accepted = matches.filter((F.col("MatchScore") >= VALIDATION_SCORE) & F.col("FinalColumn").isin(MANDATORY_TARGETS))
+    steward = matches.filter((F.col("MatchScore") >= STEWARDSHIP_SCORE) &
+                             (F.col("MatchScore") < VALIDATION_SCORE) &
+                             F.col("FinalColumn").isin(MANDATORY_TARGETS))
+    steward_rows = steward.select(
+        "FileName", "RawColumnName", "NormalisedColumnName",
+        F.col("FinalColumn").alias("SuggestedTarget"), "MatchScore",
+        F.lit("PENDING_AI").alias("Status"), F.current_timestamp().alias("CreatedDate"))
+    if steward.limit(1).count():
+        align_and_write_delta(steward_rows, TBL_STEWARD)
+    audit_matches(matches, "Semantic AI Phase 1", "AI", int((time.time()-started)*1000))
+    return accepted.cache()
+
+
+##Conflict arbitration and contract validation
+def conflict_and_contract(matches, lineage, prompts, pos_ctx, neg_ctx, file_name):
+    chosen = []
+    for target in MANDATORY_TARGETS:
+        rows = matches.filter(F.col("FinalColumn") == target).collect()
+        if not rows:
+            pattern = {"NDC": r"(?i)\bndc\b", "NPI": r"(?i)\bnpi\b",
+                       "QUANTITY": r"(?i)\b(quantity|qty)\b"}[target]
+            fallback = lineage.filter(F.col("RawColumnName").rlike(pattern)).collect()
+            if len(fallback) != 1:
+                quarantine_and_raise(file_name, "Silver Contract Validation", f"Missing or ambiguous mandatory mapping: {target}", target)
+            r = fallback[0]
+            chosen.append((r.FileName, r.RawColumnName, r.NormalisedColumnName, target, 0.80))
+            continue
+        if len(rows) == 1:
+            r = rows[0]
+            chosen.append((r.FileName, r.RawColumnName, r.NormalisedColumnName, target, r.MatchScore))
+            continue
+        candidates = [r.RawColumnName for r in rows]
+        context = spark.createDataFrame([(file_name, target, ", ".join(candidates))],
+            "FileName string, FinalColumn string, candidate_text_list string")
+        response = run_fabric_ai(context, format_prompt(prompts["phase2"], pos_ctx, neg_ctx),
+                                 ai_schema_p2, "clean_ai_json").select("clean_ai_json").collect()
+        if len(response) != 1:
+            quarantine_and_raise(file_name, "Silver Conflict Resolution", "Expected one conflict response", target)
+        obj = parse_ai_object(response[0][0], "phase2")
+        winner = obj["SelectedBaseColumn"].strip()
+        if winner not in candidates or obj["MatchScore"] < VALIDATION_SCORE:
+            quarantine_and_raise(file_name, "Silver Conflict Resolution", "Conflict selection is invalid or below threshold", target)
+        r = next(r for r in rows if r.RawColumnName == winner)
+        chosen.append((r.FileName, r.RawColumnName, r.NormalisedColumnName, target, float(obj["MatchScore"])))
+    resolved = spark.createDataFrame(chosen, empty_matches().schema)
+    if resolved.select("RawColumnName").distinct().count() != len(MANDATORY_TARGETS):
+        quarantine_and_raise(file_name, "Silver Contract Validation", "A source header was selected for multiple targets")
+    # RECOVERED separate validation prompt, with reconstructed payload/guards.
+    response = run_fabric_ai(resolved, format_prompt(prompts["validation"], pos_ctx, neg_ctx),
+                             ai_schema_p1, "clean_ai_json").select("RawColumnName", "FinalColumn", "clean_ai_json").collect()
+    if len(response) != len(chosen) or len({r.RawColumnName for r in response}) != len(chosen):
+        quarantine_and_raise(file_name, "Silver Contract Validation", "Validation response cardinality mismatch")
+    for row in response:
+        obj = parse_ai_object(row.clean_ai_json, "validation")
+        target = obj["FinalColumn"].strip().upper()
+        target = "QUANTITY" if target == "QTY" else target
+        if target != row.FinalColumn or obj["MatchScore"] < VALIDATION_SCORE:
+            quarantine_and_raise(file_name, "Silver Contract Validation", "Contract target failed validation", row.RawColumnName)
+    audit_matches(resolved, "AI conflict/contract validation", "AI Phase 2")
+    return resolved.cache()
+
+
+##Pivot, sanitization, data quality and Silver load
+def pivot_and_check(raw, resolved, file_name):
+    mapping = resolved.select("FileName", "RawColumnName", "FinalColumn")
+    joined = raw.join(mapping, ["FileName", "RawColumnName"], "inner")
+    duplicates = (joined.groupBy("FileName", "RowNumber", "FinalColumn").count()
+                  .filter(F.col("count") > 1))
+    if duplicates.limit(1).count():
+        quarantine_and_raise(file_name, "Silver Data Quality", "Duplicate row/target values would be lost during pivot")
+    wide = (joined.groupBy("FileName", "RowNumber")
+            .pivot("FinalColumn", MANDATORY_TARGETS).agg(F.first("Value")))
+    if wide.limit(1).count() == 0:
+        quarantine_and_raise(file_name, "Silver Data Load", "No matching claim records after mapping")
+    # RECOVERED regex cleanup intent; exact allowed character classes reconstructed.
+    ndc = F.regexp_replace(F.trim(F.col("NDC").cast("string")), r"[-\s]", "")
+    npi = F.regexp_replace(F.trim(F.col("NPI").cast("string")), r"[-\s]", "")
+    qty = F.regexp_replace(F.trim(F.col("QUANTITY").cast("string")), ",", "")
+    evaluated = (wide.withColumn("CLEAN_NDC", F.when(ndc == "", None).otherwise(ndc))
+                 .withColumn("CLEAN_NPI", F.when(npi == "", None).otherwise(npi))
+                 .withColumn("CLEAN_QUANTITY", F.when(qty == "", None).otherwise(qty)))
+    null_ndc = F.col("CLEAN_NDC").isNull()
+    null_npi = F.col("CLEAN_NPI").isNull()
+    null_qty = F.col("CLEAN_QUANTITY").isNull()
+    ndc_lengths = "|".join(str(v) for v in NDC_LENGTHS)
+    valid_ndc = F.col("CLEAN_NDC").rlike(r"^[0-9]+$") & F.length("CLEAN_NDC").isin(*NDC_LENGTHS)
+    valid_npi = F.col("CLEAN_NPI").rlike("^[0-9]{" + str(NPI_LENGTH) + "}$")
+    # try_cast avoids ANSI-mode exceptions before the DQ summary is built.
+    evaluated = evaluated.withColumn("_qty_number", F.expr("try_cast(CLEAN_QUANTITY as decimal(18,4))"))
+    valid_qty = F.col("CLEAN_QUANTITY").rlike(QUANTITY_PATTERN) & F.col("_qty_number").isNotNull()
+    predicates = {"null_ndc": null_ndc, "null_npi": null_npi, "null_qty": null_qty,
+                  "invalid_ndc": (~null_ndc) & (~valid_ndc),
+                  "invalid_npi": (~null_npi) & (~valid_npi),
+                  "invalid_qty": (~null_qty) & (~valid_qty)}
+    summary = evaluated.select(*[
+        F.coalesce(F.sum(F.when(condition, 1).otherwise(0)), F.lit(0)).alias(name)
+        for name, condition in predicates.items()]).first().asDict()
+    if DEBUG_ON:
+        print("DQ counts:", summary)  # counts only; no claim values.
+    failures = [f"{name}: {count}" for name, count in summary.items() if count]
+    if failures:
+        quarantine_and_raise(file_name, "Silver Data Quality", "; ".join(failures))
+    final = evaluated.select("FileName", "RowNumber", F.col("CLEAN_NPI").alias("NPI"),
+        F.col("CLEAN_NDC").alias("NDC"), F.col("_qty_number").alias("QUANTITY"))
+    # All DQ rules have passed before the append.
+    align_and_write_delta(final, TBL_SILVER)
+    return final.cache()
+
+
+##Processed-file log, exit status and cleanup
+def log_processed(final, context):
+    schema = "FileName string, FilePath string, ExceptionReason string, FailedStage string, RecordCount long, LoggedDate timestamp, Layer string, FieldName string, Status string"
+    row = (context["file_name"], context["path"], None, "Claiming & Ingestion",
+           final.count(), datetime.now(timezone.utc).replace(tzinfo=None),
+           "Silver", None, "SUCCESS")
+    align_and_write_delta(spark.createDataFrame([row], schema), TBL_PROCESSED)
+
+
+def exception_exit_message(file_names, fallback):
+    if not ENABLE_WRITES or not file_names or not spark.catalog.tableExists(TBL_EXCEPTIONS):
+        return fallback
+    exceptions = spark.table(TBL_EXCEPTIONS).filter(F.col("FileName").isin(list(file_names)))
+    preferred = exceptions.filter(F.col("FailedStage") != "Silver Exclusions")
+    rows = preferred.orderBy(F.col("LoggedDate").desc()).limit(1).collect()
+    if not rows:
+        rows = exceptions.orderBy(F.col("LoggedDate").desc()).limit(1).collect()
+    if not rows:
+        return fallback
+    output = rows[0].asDict()
+    output["ExceptionReason"] = str(output.get("ExceptionReason", ""))[:400]
+    return [output]
+
+
+def check_configuration():
+    if not CONFIGURATION_VERIFIED:
+        raise RuntimeError("Verify tables, metadata columns, prompt IDs, source keys, DQ rules and AI_RUNNER; then set CONFIGURATION_VERIFIED=True")
+    if AI_RUNNER is None or not callable(AI_RUNNER):
+        raise RuntimeError("Missing AI_RUNNER")
+    if ENABLE_WRITES:
+        for name in [TBL_AUDIT, TBL_STEWARD, TBL_SILVER, TBL_PROCESSED, TBL_EXCEPTIONS]:
+            if not spark.catalog.tableExists(name):
+                raise ValueError(f"Missing destination table: {name}")
+
+
+def process_silver():
+    check_configuration()
+    context = parse_input_path(p_filepath)
+    file_name = context["file_name"]
+    intermediates = []
+    try:
+        prompts = load_prompts()
+        raw = load_bronze(file_name); intermediates.append(raw)
+        lineage = normalize_headers(raw, prompts["normalization"], file_name); intermediates.append(lineage)
+        inc, exc = load_reference_patterns()
+        candidates = quality_and_exclusions(lineage, inc, exc, file_name); intermediates.append(candidates)
+        deterministic, remaining = deterministic_matching(candidates, inc)
+        intermediates.extend([deterministic, remaining])
+        audit_matches(deterministic, "DETERMINISTIC_INC", "DETERMINISTIC")
+        pos_ctx = "\n".join(f"{r.NormalisedInclusion}: target={r.ReferenceName}" for r in inc.collect())
+        neg_ctx = "\n".join(r.NormalisedExclusion for r in exc.collect())
+        semantic = semantic_matching(remaining, prompts["phase1"], pos_ctx, neg_ctx, file_name)
+        intermediates.append(semantic)
+        combined = deterministic.unionByName(semantic).distinct().cache(); intermediates.append(combined)
+        resolved = conflict_and_contract(combined, candidates, prompts, pos_ctx, neg_ctx, file_name)
+        intermediates.append(resolved)
+        final = pivot_and_check(raw, resolved, file_name); intermediates.append(final)
+        log_processed(final, context)
+        return {"exit_value": True, "exit_message": "Successful" if ENABLE_WRITES else "Preview successful; no tables written"}
+    except Exception as error:
+        if file_name not in quarantined_files:
+            quarantined_files.add(file_name)
+            try:
+                log_and_quarantine(file_name, "Silver Processing", str(error))
+            except Exception as logging_error:
+                return {"exit_value": False, "exit_message": str(error), "logging_error": str(logging_error)}
+        return {"exit_value": False,
+                "exit_message": exception_exit_message(quarantined_files, str(error))}
+    finally:
+        for frame in intermediates:
+            try:
+                frame.unpersist()
+            except Exception:
+                pass
+
+
+quarantined_files = set()
+if RUN_PIPELINE:
+    # RECONSTRUCTED: exit outside try, so its control-flow signal is not swallowed.
+    try:
+        result = process_silver()
+    except Exception as error:
+        result = {"exit_value": False, "exit_message": str(error)}
+    print(json.dumps(result, default=str))
+    from notebookutils import mssparkutils
+    mssparkutils.notebook.exit(json.dumps(result, default=str))
+else:
+    print("Review mode: notebook definitions loaded; pipeline execution disabled")
+
+
+##
