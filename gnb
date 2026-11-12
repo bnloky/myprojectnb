@@ -129,7 +129,7 @@ def combine_bronze_silver(bronze, silver):
 
 
 ##Exceptions and file delivery
-# Reconstructed complete metadata/error helper; explicit schema supports null fields.
+#  complete metadata/error helper; explicit schema supports null fields.
 quarantined_files = []
 successful_files_meta = []
 failed_files_meta = []
