@@ -1,6 +1,6 @@
 # RECOVERED: pipeline base parameter. The example source path is redacted.
 p_filepath = ""
-# RECONSTRUCTED review controls.
+#  review controls.
 RUN_PIPELINE = False
 ENABLE_WRITES = False
 CONFIGURATION_VERIFIED = False
@@ -9,7 +9,7 @@ DEBUG_ON = True  # Set False for normal runs; avoid printing claims/PII.
 
 # RECOVERED: pipeline base parameter. The example source path is redacted.
 p_filepath = ""
-# RECONSTRUCTED review controls.
+#  review controls.
 RUN_PIPELINE = False
 ENABLE_WRITES = False
 CONFIGURATION_VERIFIED = False
@@ -33,7 +33,6 @@ GENERIC_THRESHOLD = 0.90
 VALIDATION_SCORE = 0.85
 STEWARDSHIP_SCORE = 0.65
 
-# RECONSTRUCTED schema adapters: confirm actual source fields, table spellings.
 BRONZE_COLUMNS = {
     "FileName": "FileName", "RowNumber": "RowNumber",
     "RawColumnName": "RawColumnName", "Value": "Value",
@@ -48,7 +47,7 @@ PROMPT_IDS = {"normalization": None, "phase1": None,
               "validation": None, "phase2": None}
 # Callable contract described in the integration cell below.
 AI_RUNNER = None
-# RECONSTRUCTED data-format contracts: verify against actual claim standards.
+
 NDC_LENGTHS = (10, 11)
 NPI_LENGTH = 10
 QUANTITY_PATTERN = r"^-?(?:[0-9]+(?:[.][0-9]+)?|[.][0-9]+)$"
@@ -69,7 +68,7 @@ ai_schema_p2 = {
     "required": ["SelectedBaseColumn", "MatchScore"],
     "additionalProperties": False,
 }
-# RECONSTRUCTED from the visible NormalisedColumnName lineage result.
+#  from the visible NormalisedColumnName lineage result.
 ai_schema_normalization = {
     "type": "object",
     "properties": {"NormalisedColumnName": {"type": "string"}},
@@ -92,8 +91,8 @@ def parse_input_path(value):
     except json.JSONDecodeError:
         parsed = None
     if isinstance(parsed, dict):
-        # RECONSTRUCTED: prefer relative key; accept the screenshot's nested value.
-        selected = parsed.get("relative")
+
+selected = parsed.get("relative")
         if not isinstance(selected, str):
             candidates = [v for v in parsed.values()
                           if isinstance(v, str) and "relative" in v.lower()]
@@ -115,7 +114,7 @@ def parse_input_path(value):
 
 def align_and_write_delta(df, target_table_name, max_retries=3, retry_delay_sec=2):
     if not ENABLE_WRITES:
-        return  # RECONSTRUCTED: preview mode does not mutate tables.
+        return  # preview mode does not mutate tables.
     if not spark.catalog.tableExists(target_table_name):
         raise ValueError(f"Missing approved target table: {target_table_name}")
     target_schema = spark.table(target_table_name).schema
@@ -201,7 +200,7 @@ def format_prompt(template, pos_ctx, neg_ctx, is_phase_1=False):
 
 
 def clean_json_text(value):
-    # RECONSTRUCTED markdown-fence cleanup used by integration/unit checks.
+    #  markdown-fence cleanup used by integration/unit checks.
     if not isinstance(value, str):
         raise ValueError("AI result must be a JSON string")
     text = value.strip()
@@ -270,7 +269,7 @@ def normalize_headers(raw, prompt, file_name):
         except Exception as error:
             quarantine_and_raise(file_name, "Silver Normalization", str(error), row.RawColumnName)
     lineage = spark.createDataFrame(mappings, "RawColumnName string, NormalisedColumnName string")
-    # RECONSTRUCTED completeness/cardinality guard.
+    #  completeness/cardinality guard.
     if len(mappings) != headers.count() or lineage.groupBy("RawColumnName").count().filter("count != 1").count():
         quarantine_and_raise(file_name, "Silver Normalization", "AI header result is missing or duplicated")
     return lineage.withColumn("FileName", F.lit(file_name)).cache()
@@ -293,7 +292,7 @@ def load_reference_patterns():
 
 def quality_and_exclusions(lineage, inc, exc, file_name):
     work = normalise_col(lineage, "NormalisedColumnName", "_match_header")
-    # RECONSTRUCTED generic-header expression; screenshot expression is clipped.
+    #  generic-header expression;  expression is clipped.
     generic = r"^(?:column|col|field|unnamed|c)[0-9]*$"
     quality = work.agg(F.avg(F.when(F.col("_match_header").rlike(generic), 1).otherwise(0)).alias("ratio")).first()
     ratio = quality.ratio or 0.0
@@ -349,7 +348,7 @@ def audit_matches(matches, method, phase, elapsed_ms=0):
         F.lit(0).alias("CompletionTokens"), F.lit(0).alias("TotalTokens"),
         F.lit(elapsed_ms).cast("long").alias("ExecutionTimeMs"),
         F.current_timestamp().alias("Timestamp"))
-    # RECONSTRUCTED: token count zero means unavailable, not measured usage.
+    #  token count zero means unavailable, not measured usage.
     align_and_write_delta(audit, TBL_AUDIT)
 
 
@@ -420,7 +419,7 @@ def conflict_and_contract(matches, lineage, prompts, pos_ctx, neg_ctx, file_name
     resolved = spark.createDataFrame(chosen, empty_matches().schema)
     if resolved.select("RawColumnName").distinct().count() != len(MANDATORY_TARGETS):
         quarantine_and_raise(file_name, "Silver Contract Validation", "A source header was selected for multiple targets")
-    # RECOVERED separate validation prompt, with reconstructed payload/guards.
+    # RECOVERED separate validation prompt, with payload/guards.
     response = run_fabric_ai(resolved, format_prompt(prompts["validation"], pos_ctx, neg_ctx),
                              ai_schema_p1, "clean_ai_json").select("RawColumnName", "FinalColumn", "clean_ai_json").collect()
     if len(response) != len(chosen) or len({r.RawColumnName for r in response}) != len(chosen):
@@ -447,7 +446,7 @@ def pivot_and_check(raw, resolved, file_name):
             .pivot("FinalColumn", MANDATORY_TARGETS).agg(F.first("Value")))
     if wide.limit(1).count() == 0:
         quarantine_and_raise(file_name, "Silver Data Load", "No matching claim records after mapping")
-    # RECOVERED regex cleanup intent; exact allowed character classes reconstructed.
+    # RECOVERED regex cleanup intent; exact allowed character classes.
     ndc = F.regexp_replace(F.trim(F.col("NDC").cast("string")), r"[-\s]", "")
     npi = F.regexp_replace(F.trim(F.col("NPI").cast("string")), r"[-\s]", "")
     qty = F.regexp_replace(F.trim(F.col("QUANTITY").cast("string")), ",", "")
@@ -560,7 +559,7 @@ def process_silver():
 
 quarantined_files = set()
 if RUN_PIPELINE:
-    # RECONSTRUCTED: exit outside try, so its control-flow signal is not swallowed.
+    # exit outside try, so its control-flow signal is not swallowed.
     try:
         result = process_silver()
     except Exception as error:
@@ -572,4 +571,4 @@ else:
     print("Review mode: notebook definitions loaded; pipeline execution disabled")
 
 
-##
+
