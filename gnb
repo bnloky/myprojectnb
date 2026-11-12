@@ -1,0 +1,222 @@
+# Fabric parameter cell: mark this cell as Parameters after importing.
+p_filepath = ""  # request path, or JSON containing a requests/received path
+
+
+import json
+import re
+import os
+from datetime import datetime
+from pyspark.sql import functions as F
+from notebookutils import mssparkutils
+import pandas as pd
+import openpyxl
+spark.conf.set("spark.sql.caseSensitive", "true")
+
+
+##Project configuration
+bronze_table_name = "Bronze.tbl_ClaimsRawData"
+silver_table_name = "Silver.tbl_claimscleanseddata"
+SILVER_CANONICAL_COLS = ["NPI", "NDC", "QUANTITY"]  # visible in screenshot 3; verify casing
+output_base_directory = "Files/OutputFiles/requests/sent"
+secondary_output_base_directory = "Files/adlsassc1_gpo/responses"  # verify against your Lakehouse
+TBL_EXCEPTIONS = "Metadata.tbl_FileExceptions"
+MAX_EXPORT_ROWS = 100000
+REQUEST_BASE_DIRECTORY = "Files/adlsassc1_gpo/requests/received"  # verify shortcut name
+
+
+##Parse and standardize the request path
+def resolve_request_path(value):
+    if value is None or not str(value).strip():
+        raise ValueError("Parameter p_filepath was null or empty")
+    parsed = str(value).strip()
+    for _ in range(3):
+        if not isinstance(parsed, str):
+            break
+        try:
+            parsed = json.loads(parsed)
+        except (json.JSONDecodeError, ValueError):
+            break
+    def paths(obj):
+        if isinstance(obj, str):
+            yield obj
+        elif isinstance(obj, dict):
+            for val in obj.values():
+                yield from paths(val)
+        elif isinstance(obj, list):
+            for val in obj:
+                yield from paths(val)
+    candidates = [v.replace("\\", "/").strip() for v in paths(parsed)
+                  if "requests/received/" in v.replace("\\", "/").lower()]
+    candidates = list(dict.fromkeys(candidates))
+    if len(candidates) != 1:
+        raise ValueError("Expected exactly one requests/received path")
+    candidate = candidates[0]
+    match = re.search(r"(?P<date>\d{4}-\d{2}-\d{2})/org_id=(?P<org_id>[^/]+)/(?P<file_name>[^/]+)$", candidate)
+    if not match:
+        raise ValueError("Expected .../YYYY-MM-DD/org_id=<id>/<filename>")
+    datetime.strptime(match['date'], "%Y-%m-%d")
+    # Keep the Files-relative path used by the Bronze FileName column.
+    relative = "Files/" + candidate.split("/Files/", 1)[1] if "/Files/" in candidate else candidate
+    if not relative.startswith("Files/"):
+        relative = "Files/" + relative.lstrip("/")
+    relative = f"{REQUEST_BASE_DIRECTORY}/{match['date']}/org_id={match['org_id']}/{match['file_name']}"
+    return relative, match['date'], match['org_id'], match['file_name']
+
+
+##Select and validate Silver rows
+# Assumption: that basename uniquely identifies the request across the Silver table.
+def col(name):
+    return F.col("`" + name.replace("`", "``") + "`")
+
+def select_silver_file(df, request_path, date, org, filename):
+    result = df.filter(F.lower(F.trim(col("FileName"))).contains(filename.strip().lower()))
+    if result.rdd.isEmpty():
+        raise ValueError("No matching Silver records for " + filename)
+    return result
+
+def validate_silver(df):
+    if "RowNumber" not in df.columns:
+        raise ValueError("Silver RowNumber is required")
+    if df.filter(col("RowNumber").isNull()).limit(1).count():
+        raise ValueError("Silver RowNumber contains nulls")
+    if df.groupBy("RowNumber").count().filter(F.col("count") > 1).limit(1).count():
+        raise ValueError("Duplicate Silver RowNumber would multiply exported rows; check file matching")
+
+
+##Rebuild Bronze rows and overlay cleansed values
+# Pivot, inner join, canonical overlay: 
+# Validation guards and identifier quoting are completion additions.
+def combine_bronze_silver(bronze, silver):
+    validate_silver(silver)
+    required = {"RowNumber", "ColumnPlaceHolder", "RawColumnName", "Value"}
+    if required - set(bronze.columns):
+        raise ValueError(f"Missing Bronze columns: {sorted(required - set(bronze.columns))}")
+    mappings = bronze.select("ColumnPlaceHolder", "RawColumnName").distinct().collect()
+    def extract_index(value):
+        numbers = re.findall(r"\d+", str(value))
+        return int(numbers[0]) if numbers else 9999
+    mappings = sorted(mappings, key=lambda r: (extract_index(r['ColumnPlaceHolder']), str(r['ColumnPlaceHolder'])))
+    names = [r['RawColumnName'] for r in mappings]
+    placeholders = [r['ColumnPlaceHolder'] for r in mappings]
+    if any(not isinstance(v, str) or not v.strip() for v in names + placeholders):
+        raise ValueError("Null/empty column mapping")
+    if len({v.lower() for v in names}) != len(names) or len(set(placeholders)) != len(placeholders):
+        raise ValueError("Ambiguous or duplicate column mapping")
+    if any(v.lower() == 'rownumber' or v.lower().startswith('_silver_') for v in names):
+        raise ValueError("Raw header conflicts with internal export columns")
+    if bronze.filter(col('RowNumber').isNull()).limit(1).count():
+        raise ValueError("Null Bronze RowNumber")
+    if bronze.groupBy('RowNumber', 'ColumnPlaceHolder').count().filter(F.col('count') > 1).limit(1).count():
+        raise ValueError("Duplicate Bronze cells would make max(Value) ambiguous")
+    pivot_exprs = [F.max(F.when(col('ColumnPlaceHolder') == F.lit(r['ColumnPlaceHolder']),
+                                col('Value'))).alias(r['RawColumnName']) for r in mappings]
+    wide = bronze.groupBy('RowNumber').agg(*pivot_exprs)
+    silver_projection = silver.select(col('RowNumber'), *[
+        col(c).cast('string').alias('_silver_' + c) for c in SILVER_CANONICAL_COLS if c in silver.columns])
+    merged = wide.join(silver_projection, 'RowNumber', 'inner')
+    lookup = {c.lower(): c for c in names}
+    final_columns = []  # Screenshot exports only raw headers + missing canonical headers
+    for raw in names:
+        canonical = next((c for c in SILVER_CANONICAL_COLS if c.lower() == raw.lower()), None)
+        if canonical and '_silver_' + canonical in merged.columns:
+            merged = merged.withColumn(raw, F.coalesce(col('_silver_' + canonical), col(raw).cast('string')))
+        final_columns.append(raw)
+    for canonical in SILVER_CANONICAL_COLS:
+        if canonical.lower() not in lookup and '_silver_' + canonical in merged.columns:
+            merged = merged.withColumn(canonical, col('_silver_' + canonical))
+            final_columns.append(canonical)
+    return merged.orderBy(col('RowNumber')).select(*[col(c) for c in final_columns])
+
+
+##Exceptions and file delivery
+# Reconstructed complete metadata/error helper; explicit schema supports null fields.
+quarantined_files = []
+successful_files_meta = []
+failed_files_meta = []
+
+def log_and_quarantine(target_file_name, stage, reason, field_name=None, layer='Gold'):
+    item = {"FileName": target_file_name, "FilePath": str(p_filepath),
+            "ExceptionReason": str(reason), "FailedStage": stage,
+            "LoggedDate": datetime.now(), "FieldName": field_name, "Layer": layer}
+    quarantined_files.append(target_file_name)
+    failed_files_meta.append({**item, 'LoggedDate': item['LoggedDate'].isoformat(), 'Status': 'FAILED'})
+    try:
+        err_df = spark.createDataFrame([tuple(item.values())],
+            'FileName string, FilePath string, ExceptionReason string, FailedStage string, LoggedDate timestamp, FieldName string, Layer string')
+        err_df.write.format('delta').mode('append').option('mergeSchema', 'true').saveAsTable(TBL_EXCEPTIONS)
+    except Exception as log_error:
+        # Retain the original error and fail the result even if logging is unavailable.
+        failed_files_meta[-1]['LoggingError'] = str(log_error)
+
+def export_response(df, date, org, filename):
+    extension = os.path.splitext(filename)[1].lower()
+    if extension not in {'.xlsx', '.csv', '.txt'}:
+        raise ValueError(f"Unsupported output extension: {extension}")
+    bounded = df.limit(MAX_EXPORT_ROWS + 1).toPandas()
+    if len(bounded) > MAX_EXPORT_ROWS:
+        raise ValueError('Export exceeds configured driver row limit')
+    if extension == '.xlsx' and len(df.columns) > 16384:
+        raise ValueError('Excel column limit exceeded')
+    target_dir = f'{output_base_directory}/{date}/org_id={org}'
+    target = f'{target_dir}/{filename}'
+    mssparkutils.fs.mkdirs(target_dir)
+    # Default Lakehouse Files mount; avoids treating arbitrary remote paths as local.
+    if not target.startswith('Files/'):
+        raise ValueError('Primary export must be under the default Lakehouse Files directory')
+    local = '/lakehouse/default/' + target
+    os.makedirs(os.path.dirname(local), exist_ok=True)
+    if extension == '.xlsx':
+        bounded.to_excel(local, index=False, engine='openpyxl')
+    else:
+        bounded.to_csv(local, index=False, sep='\t' if extension == '.txt' else ',')
+    secondary_dir = f'{secondary_output_base_directory}/{date}/org_id={org}'
+    secondary = f'{secondary_dir}/{filename}'
+    mssparkutils.fs.mkdirs(secondary_dir)
+    if mssparkutils.fs.exists(secondary):
+        mssparkutils.fs.rm(secondary, recurse=False)
+    mssparkutils.fs.cp(target, secondary)
+    return target, secondary, len(bounded)
+
+
+##Run and return status to the master pipeline
+# Main pipeline: Gold output only; Bronze and Silver tables are read as inputs.
+try:
+    request_path, extracted_date, extracted_org_id, file_name = resolve_request_path(p_filepath)
+    p_filepath = request_path
+    df_bronze_all = spark.table(bronze_table_name).filter(col('FileName') == F.lit(request_path))
+    if df_bronze_all.rdd.isEmpty():
+        raise ValueError('No Bronze records matched the normalized request path')
+    df_silver_all = spark.table(silver_table_name)
+    try:
+        df_silver_file = select_silver_file(df_silver_all, request_path, extracted_date, extracted_org_id, file_name)
+        df_gold_combined = combine_bronze_silver(df_bronze_all, df_silver_file)
+        target, secondary, rows = export_response(df_gold_combined, extracted_date, extracted_org_id, file_name)
+        successful_files_meta.append({
+            'FileName': request_path, 'FilePath': target, 'SecondaryFilePath': secondary,
+            'ExceptionReason': None, 'FailedStage': 'Gold Export',
+            'LoggedDate': datetime.now().isoformat(), 'FieldName': None,
+            'Layer': 'Gold', 'Status': 'SUCCESS', 'Rows': rows})
+    except Exception as file_err:
+        log_and_quarantine(file_name, 'Gold File Processing', str(file_err))
+except Exception as pipeline_err:
+    log_and_quarantine(locals().get('file_name', 'GLOBAL_PIPELINE'),
+                       'Gold Pipeline Execution', str(pipeline_err))
+# Exit outside try/except so the notebook exit signal cannot be logged as a failure.
+exit_value = bool(successful_files_meta) and not failed_files_meta
+if failed_files_meta:
+    exit_message = [{k: v for k, v in item.items() if k != 'Status'} for item in failed_files_meta]
+    for item in exit_message:
+        if item.get('ExceptionReason'):
+            item['ExceptionReason'] = str(item['ExceptionReason'])[:400]
+else:
+    exit_message = successful_files_meta
+print(f"Gold processing finished. Exit status: {exit_value}")
+mssparkutils.notebook.exit(json.dumps({
+    'exit_value': exit_value,
+    'exit_message': exit_message
+}))
+
+
+
+
+
