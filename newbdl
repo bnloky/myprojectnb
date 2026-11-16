@@ -1,0 +1,403 @@
+01 — Fabric pipeline parameters and environment configuration
+
+# Mark this cell as the Fabric notebook parameter cell.
+p_filepath = ""                    # Source file: Files/... or abfss://...
+p_client_id = ""                   # e.g. CBG, AMPS
+p_source_event_id = ""             # Blob event ID (optional, for audit)
+p_source_version = ""              # Blob version ID or ETag, if available
+p_source_event_time = ""           # ISO-8601 UTC, if available
+p_run_id = ""                      # Pipeline run ID
+p_serialized_by_orchestrator = False # MUST be True only when a real per-path lease/serialization exists
+p_optimize = False                 # Run compaction selectively, not for every small file
+p_retention_days = 365             # Audit/retention policy; no automatic history deletion
+
+BRONZE_TABLE = "Bronze.tbl_ClaimsRawData"
+FILE_CONTROL_TABLE = "Metadata.tbl_FileProcessingControl"
+FILE_AUDIT_TABLE = "Metadata.tbl_FileIngestionAudit"
+FILE_EXCEPTION_TABLE = "Metadata.tbl_FileExceptions"
+CLIENT_CONFIG_TABLE = "Metadata.tbl_ClientIngestionConfig"
+SNAPSHOT_ROOT = "Files/GPO/ImmutableSnapshots"
+QUARANTINE_ROOT = "Files/GPO/Quarantine"
+MAX_RETRIES = 3
+
+
+02 — Imports, runtime checks and shared utilities
+import os, re, json, csv, time, uuid, hashlib, tempfile, traceback
+from datetime import datetime, timezone, timedelta
+from pathlib import PurePosixPath
+from urllib.parse import urlparse
+from pyspark.sql import functions as F, types as T
+from delta.tables import DeltaTable
+from notebookutils import mssparkutils
+
+ALLOWED_FORMATS = {"csv", "txt", "dat", "json"}
+REJECTED_FORMATS = {"xlsx", "xls", "xlsm", "dta", "pdf", "zip", "exe"}
+
+def utcnow(): return datetime.now(timezone.utc)
+def stable_hash(value): return hashlib.sha256(value.encode("utf-8")).hexdigest()
+def safe_component(value):
+    value = str(value or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", value):
+        raise ValueError(f"Unsafe or empty path component: {value!r}")
+    return value
+
+def quote_table(table):
+    parts = table.split(".")
+    if len(parts) != 2 or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", x) for x in parts):
+        raise ValueError("Invalid schema-qualified table")
+    return ".".join(f"`{x}`" for x in parts)
+
+def with_retry(action, attempts=MAX_RETRIES):
+    for attempt in range(attempts):
+        try: return action()
+        except Exception as exc:
+            msg = str(exc).lower()
+            transient = any(x in msg for x in ["concurrent", "conflict", "temporarily unavailable", "throttl"])
+            if not transient or attempt == attempts - 1: raise
+            time.sleep(min(2 ** attempt, 8))
+
+def require_runtime():
+    if not p_filepath or not p_client_id: raise ValueError("Pipeline must pass p_filepath and p_client_id")
+    if p_serialized_by_orchestrator is not True:
+        raise RuntimeError("Concurrency guard: configure real per-client/path serialization or distributed lease, then pass True")
+
+03 — One-time bootstrap: schemas, metadata, control, audit and exception tables
+# Execute once in a controlled deployment, before enabling pipelines.
+for schema in ["Bronze", "Metadata"]:
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{schema}`")
+
+spark.sql(f"""CREATE TABLE IF NOT EXISTS {quote_table(CLIENT_CONFIG_TABLE)} (
+ ClientId STRING, IsEnabled BOOLEAN, AllowedExtensions STRING, FileFormat STRING,
+ Delimiter STRING, Encoding STRING, HasHeader BOOLEAN, JsonMultiline BOOLEAN,
+ FixedWidthsJson STRING, RequiredColumnsJson STRING, MaxBadRowRatio DOUBLE,
+ EffectiveFrom TIMESTAMP, EffectiveTo TIMESTAMP, UpdatedAt TIMESTAMP
+) USING DELTA""")
+
+spark.sql(f"""CREATE TABLE IF NOT EXISTS {quote_table(FILE_CONTROL_TABLE)} (
+ FileVersionId STRING, ClientId STRING, SourcePath STRING, SourceVersion STRING,
+ ContentSHA256 STRING, FileName STRING, FileFormat STRING, SnapshotPath STRING,
+ FileSizeBytes BIGINT, VersionNumber BIGINT, EffectiveFrom TIMESTAMP,
+ EffectiveTo TIMESTAMP, IsCurrent BOOLEAN, Status STRING, SourceEventTime TIMESTAMP,
+ ProcessedAt TIMESTAMP, RunId STRING, RowCount BIGINT
+) USING DELTA""")
+
+spark.sql(f"""CREATE TABLE IF NOT EXISTS {quote_table(BRONZE_TABLE)} (
+ FileRecordId STRING, FileVersionId STRING, ClientId STRING, SourcePath STRING,
+ FileName STRING, SourceVersion STRING, ContentSHA256 STRING, FileFormat STRING,
+ RowNumber BIGINT, ColumnPlaceholder STRING, RawColumnName STRING,
+ ColumnDataType STRING, Value STRING, IngestedAt TIMESTAMP, RunId STRING
+) USING DELTA""")
+
+spark.sql(f"""CREATE TABLE IF NOT EXISTS {quote_table(FILE_AUDIT_TABLE)} (
+ AuditId STRING, RunId STRING, ClientId STRING, SourcePath STRING,
+ FileVersionId STRING, Status STRING, RowCount BIGINT, StartedAt TIMESTAMP,
+ EndedAt TIMESTAMP, Message STRING
+) USING DELTA""")
+
+spark.sql(f"""CREATE TABLE IF NOT EXISTS {quote_table(FILE_EXCEPTION_TABLE)} (
+ ExceptionId STRING, RunId STRING, ClientId STRING, SourcePath STRING,
+ FileVersionId STRING, FailedStage STRING, ErrorMessage STRING,
+ QuarantinePath STRING, LoggedAt TIMESTAMP
+) USING DELTA""")
+
+04 — Client configuration lookup and source path validation
+
+def resolve_source_path(path):
+    path = str(path or "").strip().replace("\\", "/")
+    if not path or ".." in PurePosixPath(path).parts or any(c in path for c in ["\n", "\r", "\x00"]):
+        raise ValueError("Missing or unsafe source path")
+    if not (path.startswith("Files/") or path.startswith("abfss://")):
+        raise ValueError("Only Lakehouse Files/ or approved abfss:// paths are supported")
+    if path.startswith("abfss://"):
+        parsed = urlparse(path)
+        if not parsed.netloc or not parsed.path: raise ValueError("Malformed ABFSS path")
+    filename = path.rsplit("/", 1)[-1]
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext not in ALLOWED_FORMATS: raise ValueError(f"Rejected unsupported extension: .{ext}")
+    return path, filename, ext
+
+def load_client_config(client_id, extension, at_time):
+    client_id = safe_component(client_id)
+    candidates = (spark.table(CLIENT_CONFIG_TABLE)
+        .where((F.col("ClientId") == client_id) & F.col("IsEnabled") &
+               (F.col("EffectiveFrom") <= F.lit(at_time)) &
+               (F.col("EffectiveTo").isNull() | (F.col("EffectiveTo") > F.lit(at_time))))
+        .orderBy(F.col("EffectiveFrom").desc()).limit(2).collect())
+    if len(candidates) != 1: raise ValueError("Expected exactly one active client configuration")
+    cfg = candidates[0].asDict()
+    allowed = {x.strip().lower().lstrip(".") for x in (cfg["AllowedExtensions"] or "").split(",")}
+    if extension not in allowed: raise ValueError(f"Extension .{extension} not allowed for client {client_id}")
+    if cfg["FileFormat"] not in ("delimited", "fixed_width", "json"):
+        raise ValueError("Invalid FileFormat configuration")
+    if extension == "json" and cfg["FileFormat"] != "json": raise ValueError("JSON extension requires JSON parser")
+    if extension != "json" and cfg["FileFormat"] == "json": raise ValueError("Non-JSON extension cannot use JSON parser")
+    return cfg
+
+05 — Immutable source snapshot, SHA-256 and source-version identity
+
+def copy_to_local(source_path, local_path):
+    # Fabric filesystem copy; confirm file:/ support in your runtime.
+    mssparkutils.fs.cp(source_path, "file:" + local_path, False)
+    if not os.path.isfile(local_path): raise RuntimeError("Local snapshot copy not accessible")
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+def prepare_snapshot(source_path, client_id, local_path):
+    # IMPORTANT: for overwritten Azure blobs, source_path MUST resolve to the
+    # event's immutable blob version (or be staged upstream before overwrite).
+    copy_to_local(source_path, local_path)
+    checksum = sha256_file(local_path)
+    version_id = stable_hash(client_id + "|" + source_path + "|" + checksum)
+    dest = f"{SNAPSHOT_ROOT}/{safe_component(client_id)}/{version_id}/{source_path.rsplit('/',1)[-1]}"
+    mssparkutils.fs.mkdirs(dest.rsplit("/", 1)[0])
+    if not mssparkutils.fs.exists(dest):
+        mssparkutils.fs.cp("file:" + local_path, dest, False)
+    # Verify destination checksum to detect bad/incomplete copy.
+    with tempfile.TemporaryDirectory() as td:
+        verify_path = os.path.join(td, "verify.bin")
+        copy_to_local(dest, verify_path)
+        if sha256_file(verify_path) != checksum: raise RuntimeError("Snapshot checksum mismatch")
+    return checksum, version_id, dest, os.path.getsize(local_path)
+
+06 — Duplicate detection, file version ordering and effective dating
+
+def get_file_history(client_id, source_path):
+    return (spark.table(FILE_CONTROL_TABLE)
+        .where((F.col("ClientId") == client_id) & (F.col("SourcePath") == source_path)))
+
+def determine_version(client_id, source_path, checksum, event_time):
+    history = get_file_history(client_id, source_path)
+    duplicate = (history.where((F.col("ContentSHA256") == checksum) & (F.col("Status") == "SUCCESS"))
+        .limit(1).count() > 0)
+    if duplicate: return "SKIP_DUPLICATE", None
+    latest = history.where(F.col("Status") == "SUCCESS").orderBy(F.col("VersionNumber").desc()).limit(1).collect()
+    if latest and event_time <= latest[0]["EffectiveFrom"].replace(tzinfo=timezone.utc):
+        raise ValueError("Late or out-of-order file version: manual reconciliation required")
+    return "PROCESS", (int(latest[0]["VersionNumber"]) + 1 if latest else 1)
+
+def publish_file_version(record):
+    # Per-path serialization is mandatory. The Bronze MERGE is replay-safe;
+    # publication follows it, allowing recovery after a partial failure.
+    control = DeltaTable.forName(spark, FILE_CONTROL_TABLE)
+    old = ((F.col("ClientId") == F.lit(record["ClientId"])) &
+           (F.col("SourcePath") == F.lit(record["SourcePath"])) &
+           (F.col("FileVersionId") != F.lit(record["FileVersionId"])) & F.col("IsCurrent"))
+    with_retry(lambda: control.update(old, {"EffectiveTo": F.lit(record["EffectiveFrom"]), "IsCurrent": F.lit(False)}))
+    schema = spark.table(FILE_CONTROL_TABLE).schema
+    row = spark.createDataFrame([record], schema=schema)
+    with_retry(lambda: DeltaTable.forName(spark, FILE_CONTROL_TABLE).alias("t")
+        .merge(row.alias("s"), "t.FileVersionId = s.FileVersionId")
+        .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute())
+
+07 — Delimiter detection, header normalization and file parsing
+
+def detect_delimiter(local_path, encoding, configured):
+    if configured: return configured.replace("\\t", "\t")
+    with open(local_path, "r", encoding=encoding, errors="replace") as f:
+        sample = f.read(16384)
+    try: return csv.Sniffer().sniff(sample, delimiters=",|\t;").delimiter
+    except csv.Error: raise ValueError("Could not detect delimiter; configure it for this client")
+
+def normalize_headers(columns):
+    seen, result = {}, []
+    for i, name in enumerate(columns, 1):
+        cleaned = re.sub(r"\s+", "_", str(name or "").strip()) or f"Unnamed_{i}"
+        cleaned = re.sub(r"[^A-Za-z0-9_]", "_", cleaned)
+        base = cleaned or f"Unnamed_{i}"
+        seen[base.lower()] = seen.get(base.lower(), 0) + 1
+        result.append(base if seen[base.lower()] == 1 else f"{base}_{seen[base.lower()]}")
+    return result
+
+def read_source(snapshot_path, local_path, ext, cfg):
+    fmt = cfg["FileFormat"]
+    if fmt == "json":
+        df = (spark.read.option("multiLine", bool(cfg["JsonMultiline"]))
+              .option("mode", "PERMISSIVE").json(snapshot_path))
+        if "_corrupt_record" in df.columns:
+            if df.filter(F.col("_corrupt_record").isNotNull()).limit(1).count():
+                raise ValueError("Malformed JSON records; quarantine input")
+            df = df.drop("_corrupt_record")
+        # JSON object/array fields serialized for lossless raw-value representation.
+        for field in df.schema.fields:
+            if isinstance(field.dataType, (T.StructType, T.ArrayType, T.MapType)):
+                df = df.withColumn(field.name, F.to_json(F.col(f"`{field.name.replace('`','``')}`")))
+    elif fmt == "fixed_width":
+        widths = json.loads(cfg["FixedWidthsJson"] or "[]")
+        if not widths or not all(isinstance(w, int) and w > 0 for w in widths):
+            raise ValueError("Fixed-width DAT requires positive FixedWidthsJson")
+        raw = spark.read.text(snapshot_path)
+        df = raw.select(*[F.substring("value", 1 + sum(widths[:i]), w).alias(f"C{i+1}") for i, w in enumerate(widths)])
+    else:
+        delimiter = detect_delimiter(local_path, cfg["Encoding"] or "utf-8-sig", cfg["Delimiter"])
+        df = (spark.read.option("header", bool(cfg["HasHeader"]))
+              .option("sep", delimiter).option("encoding", cfg["Encoding"] or "UTF-8")
+              .option("inferSchema", False).option("mode", "PERMISSIVE")
+              .csv(snapshot_path))
+        if "_corrupt_record" in df.columns:
+            if df.where(F.col("_corrupt_record").isNotNull()).limit(1).count():
+                raise ValueError("Malformed delimited input")
+            df = df.drop("_corrupt_record")
+    if not df.columns: raise ValueError("No columns found")
+    clean = normalize_headers(df.columns)
+    df = df.toDF(*clean)
+    return df
+
+08 — Data quality checks and scalable EAV conversion
+
+def validate_data(df, cfg):
+    if df.limit(1).count() == 0: raise ValueError("Empty input")
+    required = json.loads(cfg["RequiredColumnsJson"] or "[]")
+    missing = [c for c in required if c.lower() not in {x.lower() for x in df.columns}]
+    if missing: raise ValueError(f"Missing required source columns: {missing}")
+    # Explicit basic quality checks. Expand with client-specific contracts.
+    if len(df.columns) != len(set(x.lower() for x in df.columns)):
+        raise ValueError("Header normalization collision")
+    return df
+
+def to_eav(df, client_id, source_path, filename, ext, checksum, version_id, run_id):
+    # Spark-native unpivot: no collect/list of all file records on the driver.
+    # RowNumber is generated for traceability only; it is NOT a stable original
+    # source line number. FileRecordId uses a canonical row-content hash +
+    # duplicate ordinal to preserve repeated identical rows within a version.
+    from pyspark.sql.window import Window
+    cols = df.columns
+    str_df = df.select(*[F.col(f"`{c.replace('`','``')}`").cast("string").alias(c) for c in cols])
+    packed = F.to_json(F.array(*[F.struct(F.lit(c).alias("k"), F.col(f"`{c.replace('`','``')}`").alias("v")) for c in cols]), options={"ignoreNullFields":"false"})
+    str_df = str_df.withColumn("_row_hash", F.sha2(packed, 256))
+    # Identical rows are indistinguishable; duplicate ordinal preserves multiplicity.
+    # This is replay-safe for a stable source snapshot.
+    w = Window.partitionBy("_row_hash").orderBy("_row_hash")
+    str_df = str_df.withColumn("_duplicate_ordinal", F.row_number().over(w))
+    str_df = str_df.withColumn("_row_id", F.sha2(F.concat_ws("|", F.lit(version_id), "_row_hash", F.col("_duplicate_ordinal")), 256))
+    entries = [F.struct(F.lit(i+1).alias("pos"), F.lit(name).alias("name"),
+                        F.col(f"`{name.replace('`','``')}`").alias("value")) for i, name in enumerate(cols)]
+    eav = (str_df.select("_row_id", F.explode(F.array(*entries)).alias("entry"))
+      .select(F.sha2(F.concat_ws("|", "_row_id", F.col("entry.pos")), 256).alias("FileRecordId"),
+              F.lit(version_id).alias("FileVersionId"), F.lit(client_id).alias("ClientId"),
+              F.lit(source_path).alias("SourcePath"), F.lit(filename).alias("FileName"),
+              F.lit(p_source_version or "").alias("SourceVersion"), F.lit(checksum).alias("ContentSHA256"),
+              F.lit(ext).alias("FileFormat"),
+              F.lit(None).cast("long").alias("RowNumber"),
+              F.concat(F.lit("C"), F.col("entry.pos")).alias("ColumnPlaceholder"),
+              F.col("entry.name").alias("RawColumnName"),
+              F.when(F.col("entry.value").isNull(), "Null").otherwise("String").alias("ColumnDataType"),
+              F.col("entry.value").alias("Value"), F.current_timestamp().alias("IngestedAt"),
+              F.lit(run_id).alias("RunId")))
+    return eav
+
+09 — Schema alignment and idempotent Delta Bronze MERGE
+
+def align_to_table(df, target):
+    schema = spark.table(target).schema
+    actual = {c.lower(): c for c in df.columns}
+    extra = set(actual) - {f.name.lower() for f in schema.fields}
+    if extra: raise ValueError(f"Unexpected Bronze columns: {sorted(extra)}")
+    expressions = []
+    for field in schema.fields:
+        col = actual.get(field.name.lower())
+        if col is None:
+            if not field.nullable: raise ValueError(f"Missing required column: {field.name}")
+            expressions.append(F.lit(None).cast(field.dataType).alias(field.name))
+        else:
+            expressions.append(F.col(f"`{col.replace('`','``')}`").cast(field.dataType).alias(field.name))
+    return df.select(*expressions)
+
+def write_bronze_idempotent(df):
+    source = align_to_table(df, BRONZE_TABLE)
+    # MERGE is idempotent by deterministic FileRecordId for serial processing.
+    with_retry(lambda: DeltaTable.forName(spark, BRONZE_TABLE).alias("t")
+        .merge(source.alias("s"), "t.FileRecordId = s.FileRecordId")
+        .whenNotMatchedInsertAll().execute())
+
+10 — Audit logging, quarantine, and alert-ready pipeline status
+
+def append_audit(run_id, client_id, source_path, version_id, status, rows, started, message):
+    record = [(str(uuid.uuid4()), run_id, client_id, source_path, version_id, status,
+               int(rows), started, utcnow(), str(message)[:4000])]
+    schema = spark.table(FILE_AUDIT_TABLE).schema
+    with_retry(lambda: spark.createDataFrame(record, schema).write.format("delta").mode("append").saveAsTable(FILE_AUDIT_TABLE))
+
+def log_exception(run_id, client_id, source_path, version_id, stage, error, quarantine_path):
+    record = [(str(uuid.uuid4()), run_id, client_id, source_path, version_id,
+               stage, str(error)[:4000], quarantine_path, utcnow())]
+    schema = spark.table(FILE_EXCEPTION_TABLE).schema
+    with_retry(lambda: spark.createDataFrame(record, schema).write.format("delta").mode("append").saveAsTable(FILE_EXCEPTION_TABLE))
+
+def quarantine_snapshot(snapshot_path, client_id, version_id):
+    if not snapshot_path or not mssparkutils.fs.exists(snapshot_path): return ""
+    dest = f"{QUARANTINE_ROOT}/{safe_component(client_id)}/{version_id or uuid.uuid4().hex}/{snapshot_path.rsplit('/',1)[-1]}"
+    mssparkutils.fs.mkdirs(dest.rsplit("/", 1)[0])
+    mssparkutils.fs.cp(snapshot_path, dest, False)  # copy, never delete immutable history
+    return dest
+
+11 — Main Bronze processing: new, duplicate, updated, recovery
+
+def process_bronze():
+    require_runtime()
+    started = utcnow()
+    run_id = p_run_id or str(uuid.uuid4())
+    client_id = safe_component(p_client_id)
+    source_path, filename, ext = resolve_source_path(p_filepath)
+    cfg = load_client_config(client_id, ext, started)
+    snapshot_path, version_id, stage = "", "", "PRECHECK"
+    with tempfile.TemporaryDirectory(prefix="gpo_bronze_") as td:
+        local_path = os.path.join(td, filename)
+        try:
+            if not mssparkutils.fs.exists(source_path): raise FileNotFoundError(source_path)
+            stage = "SNAPSHOT"
+            checksum, version_id, snapshot_path, size_bytes = prepare_snapshot(source_path, client_id, local_path)
+            event_time = (datetime.fromisoformat(p_source_event_time.replace("Z", "+00:00"))
+                          if p_source_event_time else started)
+            if event_time.tzinfo is None: event_time = event_time.replace(tzinfo=timezone.utc)
+            event_time = event_time.astimezone(timezone.utc)
+            stage = "VERSION_CHECK"
+            decision, version_number = determine_version(client_id, source_path, checksum, event_time)
+            if decision == "SKIP_DUPLICATE":
+                append_audit(run_id, client_id, source_path, version_id, "SKIPPED", 0, started, "Same successful content hash")
+                return {"exit_value": True, "status": "SKIPPED", "file_version_id": version_id, "rows": 0}
+            stage = "PARSE"
+            df = validate_data(read_source(snapshot_path, local_path, ext, cfg), cfg)
+            stage = "EAV"
+            eav = to_eav(df, client_id, source_path, filename, ext, checksum, version_id, run_id)
+            # Avoid full-file driver collect; count is a distributed Spark action.
+            rows = eav.count()
+            stage = "BRONZE_MERGE"
+            write_bronze_idempotent(eav)
+            stage = "VERSION_PUBLISH"
+            record = dict(FileVersionId=version_id, ClientId=client_id, SourcePath=source_path,
+                          SourceVersion=p_source_version or "", ContentSHA256=checksum,
+                          FileName=filename, FileFormat=ext, SnapshotPath=snapshot_path,
+                          FileSizeBytes=int(size_bytes), VersionNumber=int(version_number),
+                          EffectiveFrom=event_time.replace(tzinfo=None), EffectiveTo=None,
+                          IsCurrent=True, Status="SUCCESS", SourceEventTime=event_time.replace(tzinfo=None),
+                          ProcessedAt=utcnow().replace(tzinfo=None), RunId=run_id, RowCount=int(rows))
+            publish_file_version(record)
+            append_audit(run_id, client_id, source_path, version_id, "SUCCESS", rows, started, "Bronze committed")
+            if p_optimize:
+                spark.sql(f"OPTIMIZE {quote_table(BRONZE_TABLE)}")
+            return {"exit_value": True, "status": "SUCCESS", "file_version_id": version_id,
+                    "version_number": version_number, "rows": rows, "sha256": checksum}
+        except Exception as exc:
+            quarantine_path, log_errors = "", []
+            try: quarantine_path = quarantine_snapshot(snapshot_path, client_id, version_id)
+            except Exception as q_exc: log_errors.append(f"quarantine: {q_exc}")
+            try: log_exception(run_id, client_id, source_path, version_id, stage, exc, quarantine_path)
+            except Exception as l_exc: log_errors.append(f"exception log: {l_exc}")
+            try: append_audit(run_id, client_id, source_path, version_id, "FAILED", 0, started, f"{stage}: {exc}")
+            except Exception as a_exc: log_errors.append(f"audit: {a_exc}")
+            return {"exit_value": False, "status": "FAILED", "stage": stage,
+                    "file_version_id": version_id, "error": str(exc), "secondary_errors": log_errors,
+                    "quarantine_path": quarantine_path}
+
+12 — Fabric pipeline execution and structured JSON exit
+
+# Pipeline must inspect exit_value and explicitly route FAILED to a Fail activity / alert.
+# Execute this cell for a real ingestion run after configuring the parameter cell.
+result = process_bronze()
+print(json.dumps(result, default=str))
+mssparkutils.notebook.exit(json.dumps(result, default=str))
