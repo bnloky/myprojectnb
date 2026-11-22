@@ -23,3 +23,7 @@ WHEN MATCHED THEN UPDATE SET
   t.is_active     = s.is_active
 WHEN NOT MATCHED THEN INSERT (client_name, source_system, source_type, is_active)
 VALUES (s.client_name, s.source_system, s.source_type, s.is_active);
+
+
+
+Rewrite this bronze data log notebook code. The thing is actually how to extract the data from the files and keep it into the bronze table. But I don't want to lose the any original data, like starting with zeros, like that. You have to convert it completely into string so then after that keep it into the as much as original, as much as same as the original data into the table so that in that case you have to handle the convert to schema. You have to keep it and convert all the columns into the table, all the columns into the strings format so that write whatever the code I give it in the thing, you have to keep it all the things same as. Rewrite it. You have to handle the, while running this code, I am getting that above error. So you have to handle that error. And keep the same as files data into the tables
