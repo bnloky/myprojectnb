@@ -3,3 +3,23 @@ INSERT INTO tbl_clinet_config (client_id,client_name, source_system, is_active)
 VALUES
   ('c001', 'cbg', 'blobstorage','yes'),
   ('c002', 'Drexi_MPS','blobstorage', 'yes');
+
+
+
+
+
+%%sql
+MERGE INTO tbl_source_registry AS t
+USING (
+  SELECT * FROM VALUES
+    ('c001', 'cbg', 'blobstorage', 'yes'),
+    ('c002', 'Drexi_MPS', 'blobstorage', 'yes')
+  AS s(client_name, source_system, source_type, is_active)
+) AS s
+ON t.client_name = s.client_name
+WHEN MATCHED THEN UPDATE SET
+  t.source_system = s.source_system,
+  t.source_type   = s.source_type,
+  t.is_active     = s.is_active
+WHEN NOT MATCHED THEN INSERT (client_name, source_system, source_type, is_active)
+VALUES (s.client_name, s.source_system, s.source_type, s.is_active);
