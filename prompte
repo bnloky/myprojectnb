@@ -79,5 +79,3 @@ CONSTRAINTS
 
 Return only the segregated notebook cells and the short run-order guide.
 ```
-
-Paste that with your current notebook when you want it split cell-by-cell for sequential or Run All execution.
