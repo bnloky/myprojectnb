@@ -1,81 +1,67 @@
-Use this prompt:
-
-```text
-Refactor my existing Microsoft Fabric Lakehouse PySpark notebook into clearly segregated notebook cells.
+I have an existing Microsoft Fabric Lakehouse PySpark notebook that loads Landing_zone files into Bronze and also creates/uses Control (metadata) tables inside the same notebook.
 
 GOAL
-- Split the entire notebook into separate cells by responsibility/function.
-- Each cell must be able to run on its own after its prerequisite cells have run.
-- If I use Run All, cells must execute successfully one after another in order.
-- Do NOT change business logic unless required for clean cell boundaries.
-- Do NOT merge everything into one giant cell.
-- Keep Landing -> Bronze behavior intact (all-string Bronze, Excel to Exceptions, multi-client load, and any added hashing/idempotency/versioning/validation/audit logic if present).
+- Extract ALL Control/metadata table CREATE logic out of the main notebook into a SEPARATE setup script/notebook.
+- Create those tables under the existing lakehouse schema named: Control
+- Do NOT disturb or rewrite the main Landing -> Bronze processing logic.
+- The main notebook should only ACCESS/USE the Control tables (read/write rows), not own the DDL/create definitions.
+- Give me separate code whose only job is: create required Control tables in Control schema (IF NOT EXISTS / safe re-run).
 
-CELL DESIGN RULES
-1) One purpose per cell.
-2) Put shared CONFIG in its own top cell.
-3) Put shared imports in its own cell.
-4) Put helper functions in one or more dedicated cells (no heavy execution there except def/class).
-5) Put Control table DDL / ensure-tables in its own cell.
-6) Put discovery, hashing, decision (idempotency/versioning), read/transform, validation, Bronze write, audit/logging, Delta history, and summary each in separate cells where applicable.
-7) Every cell should start with a short markdown-style comment header:
-   # CELL N — <Name>
-   # Purpose: ...
-   # Depends on: CELL ...
-   # Outputs: ...
-8) Avoid hidden order bugs:
-   - define variables before use
-   - create tables before writing
-   - define functions before calling
-9) Make Run All safe:
-   - idempotent setup cells (CREATE SCHEMA/TABLE IF NOT EXISTS)
-   - clear status prints after each major cell
-10) If a cell is optional (e.g., Delta history demo), mark it OPTIONAL but keep it runnable.
-11) Do not require manual copy-paste between cells during a normal run; cells should use notebook-scoped variables/functions.
-12) Preserve existing folder conventions:
-   - Files/Landing_zone/<client>/
-   - Files/Exceptions/<client>/Excel/
-   - Files/Quarantine/<client>/ (if used)
-   - Files/Archive/<client>/... (if used)
-
-REQUESTED CELL BREAKDOWN (use this structure; adjust names only if needed)
-Cell 0 — Markdown: Notebook overview + run order
-Cell 1 — Imports
-Cell 2 — CONFIG (paths, schemas, extensions, defaults, overrides)
-Cell 3 — Helper functions (path/list/move/sanitize/read/hash/decision helpers)
-Cell 4 — Ensure schemas/folders
-Cell 5 — Ensure Control tables (file_processing_control, ingestion_audit, etc.)
-Cell 6 — Discover client folders + files
-Cell 7 — File hashing
-Cell 8 — Idempotency + file version decision
-Cell 9 — Validation + duplicate checks (Bronze-level)
-Cell 10 — Quarantine / Excel exception handling actions
-Cell 11 — Read + transform to all-string + technical columns
-Cell 12 — Write Bronze Delta tables (APPEND for versioned loads)
-Cell 13 — Update control/audit statuses (SUCCESS/SKIPPED/FAILED)
-Cell 14 — Delta table versioning/history demo (DESCRIBE HISTORY / time travel examples)
-Cell 15 — Final summary/display
+REQUIREMENTS
+1) Identify every Control/metadata table referenced by the notebook, including typical ones such as:
+   - Control.client_registry (if used)
+   - Control.source_system_config (if used)
+   - Control.ingestion_config (if used)
+   - Control.file_processing_control
+   - Control.ingestion_audit
+   - any other metadata/control tables present in my notebook
+2) Produce a SEPARATE notebook/script: NB_Control_Tables_Setup
+   - Cell(s) only for:
+     - imports (minimal)
+     - CONFIG (CONTROL_SCHEMA = "Control")
+     - CREATE SCHEMA IF NOT EXISTS Control
+     - CREATE each control table if not exists (Delta)
+     - optional: show tables / describe tables for verification
+3) Table creation must be idempotent:
+   - running setup multiple times must not fail
+   - use CREATE SCHEMA IF NOT EXISTS
+   - use CREATE TABLE IF NOT EXISTS (or equivalent safe Delta pattern in Fabric)
+4) Preserve correct column types, especially:
+   - file_version -> INT
+   - delta_table_version (if present) -> BIGINT
+   - sha256, paths, status, batch_id -> STRING
+   - row counts -> BIGINT/LONG
+   - timestamps -> TIMESTAMP
+5) Do NOT move business load logic into the setup notebook.
+6) Do NOT break main notebook access:
+   - show the minimal changes needed in the main notebook:
+     - remove/disable CREATE TABLE DDL for Control tables
+     - keep reads/writes to Control.* as-is
+     - add a short precondition check that required Control tables exist (fail with clear message if setup was not run)
+7) Keep Excel/Landing/Bronze behavior unchanged.
 
 OUTPUT FORMAT
-1) Give the exact recommended cell order as a checklist.
-2) Produce the full notebook content cell by cell.
-   - For each cell, clearly label:
-     ### CELL N — Name
-     then the complete code for that cell.
-3) For each cell, include:
-   - Purpose
-   - Depends on
-   - What it outputs/creates
-4) Call out any tiny hook changes needed so cells work sequentially.
-5) Keep comments concise and practical.
-6) Ensure that running CELL1 → CELL15 in order works, and also Run All works.
+1) List of Control/metadata tables to be created (name + purpose).
+2) Full separate setup notebook code, cell-wise if useful:
+   - CELL 1 Imports
+   - CELL 2 CONFIG
+   - CELL 3 Create Control schema
+   - CELL 4 Create control tables
+   - CELL 5 Verification (SHOW TABLES / DESCRIBE)
+3) Exact columns/DDL for each Control table.
+4) Minimal patch notes for the main notebook:
+   - what to delete (DDL only)
+   - what to keep (DML access)
+   - optional existence-check snippet
+5) Run order:
+   - First run NB_Control_Tables_Setup
+   - Then run main Landing -> Bronze notebook
 
 CONSTRAINTS
-- Fabric Lakehouse notebook + PySpark + mssparkutils
-- Additive/refactor for structure; do not invent unrelated features
-- Bronze business columns remain string
-- File version (INT) and Delta table version (BIGINT) must remain separate fields/types
-- Clear handling notes if a later cell depends on lists/dataframes created earlier (e.g., files_df, decisions_df, batch_id)
+- Fabric Lakehouse + PySpark
+- Schema name: Control
+- Separate setup code only for control/metadata tables
+- Do not disturb existing processing code beyond removing embedded Control DDL and ensuring table access still works
+- Clear comments; production-safe re-runnable setup
 
-Return only the segregated notebook cells and the short run-order guide.
-```
+If my current notebook content is pasted below, base the extracted Control table DDL exactly on what the notebook expects (column names/types), and do not invent unrelated tables.
