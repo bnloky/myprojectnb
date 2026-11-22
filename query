@@ -1,0 +1,5 @@
+%%sql
+INSERT INTO tbl_clinet_config (client_id,client_name, source_system, is_active)
+VALUES
+  ('c001', 'cbg', 'blobstorage','yes'),
+  ('c002', 'Drexi_MPS','blobstorage', 'yes');
