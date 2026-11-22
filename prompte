@@ -1,67 +1,83 @@
-Add file-level IDEMPOTENCY and FILE VERSIONING to my existing Microsoft Fabric Lakehouse PySpark notebook that already loads Landing_zone client folders into Bronze (all columns as string). Do NOT rewrite the whole notebook into a large confusing control framework. Keep my current working load logic and add only what is needed for idempotency + file versioning.
+Use this prompt:
 
-Context:
-- Source: Files/Landing_zone/<client_folder>/
-- One Bronze Delta table per client (all string columns)
-- Excel files are already moved to Files/Exceptions/<client>/Excel/ and must remain unprocessed
-- I want safe re-runs: same file content must not load twice; changed content under same name must load as a new file version
+```text
+Refactor my existing Microsoft Fabric Lakehouse PySpark notebook into clearly segregated notebook cells.
 
-Definitions to implement:
-1) Idempotency:
-   - Same source path/file name + SAME content hash + previous status SUCCESS => SKIP (do not load again, do not create duplicate Bronze rows)
-   - New file name/path never seen => PROCESS as version 1
-   - Previous FAILED for same path+hash => RETRY/PROCESS again
-2) File versioning:
-   - Same source path/file name + DIFFERENT content hash => treat as NEW file version
-   - file_version = last version for that path + 1
-   - PROCESS/load the new version
-   - Keep history of older versions in the control/tracking table (do not delete old SUCCESS rows)
+GOAL
+- Split the entire notebook into separate cells by responsibility/function.
+- Each cell must be able to run on its own after its prerequisite cells have run.
+- If I use Run All, cells must execute successfully one after another in order.
+- Do NOT change business logic unless required for clean cell boundaries.
+- Do NOT merge everything into one giant cell.
+- Keep Landing -> Bronze behavior intact (all-string Bronze, Excel to Exceptions, multi-client load, and any added hashing/idempotency/versioning/validation/audit logic if present).
 
-Required tracking table (create if not exists), keep it simple:
-Control.file_processing_control with columns like:
-- file_id (unique id per processing attempt/version)
-- client_code
-- client_folder
-- source_path
-- file_name
-- file_size
-- sha256
-- file_version (int)
-- status (RECEIVED / SUCCESS / SKIPPED / FAILED)
-- batch_id
-- target_table
-- row_count
-- processed_at
-- error_message
+CELL DESIGN RULES
+1) One purpose per cell.
+2) Put shared CONFIG in its own top cell.
+3) Put shared imports in its own cell.
+4) Put helper functions in one or more dedicated cells (no heavy execution there except def/class).
+5) Put Control table DDL / ensure-tables in its own cell.
+6) Put discovery, hashing, decision (idempotency/versioning), read/transform, validation, Bronze write, audit/logging, Delta history, and summary each in separate cells where applicable.
+7) Every cell should start with a short markdown-style comment header:
+   # CELL N — <Name>
+   # Purpose: ...
+   # Depends on: CELL ...
+   # Outputs: ...
+8) Avoid hidden order bugs:
+   - define variables before use
+   - create tables before writing
+   - define functions before calling
+9) Make Run All safe:
+   - idempotent setup cells (CREATE SCHEMA/TABLE IF NOT EXISTS)
+   - clear status prints after each major cell
+10) If a cell is optional (e.g., Delta history demo), mark it OPTIONAL but keep it runnable.
+11) Do not require manual copy-paste between cells during a normal run; cells should use notebook-scoped variables/functions.
+12) Preserve existing folder conventions:
+   - Files/Landing_zone/<client>/
+   - Files/Exceptions/<client>/Excel/
+   - Files/Quarantine/<client>/ (if used)
+   - Files/Archive/<client>/... (if used)
 
-Processing rules per data file:
-1. Discover supported files (.txt/.csv/.dat/etc.) under each client folder
-2. Compute SHA-256 of file content (scalable; do not load huge files fully into driver memory if avoidable)
-3. Look up latest record(s) for this source_path in Control.file_processing_control
-4. Decision:
-   - If exists SUCCESS with same sha256 => status SKIPPED, do not write to Bronze
-   - If no prior SUCCESS for this path => file_version=1, PROCESS
-   - If prior SUCCESS with different sha256 => file_version=max(previous)+1, PROCESS
-   - If prior FAILED with same sha256 and no SUCCESS => PROCESS retry with same version number logic you choose (document it)
-5. On PROCESS:
-   - Read file as all string (inferSchema=false)
-   - Append technical columns including: _source_path, _source_file, _file_sha256, _file_version, _batch_id, _ingestion_ts, _client_code
-   - Write to Bronze using APPEND for versioned loads (do not overwrite whole table just to simulate idempotency)
-   - After successful write, insert/update tracking row status=SUCCESS with row_count
-6. On failure:
-   - Record status=FAILED with error_message
-   - Do not mark SUCCESS
+REQUESTED CELL BREAKDOWN (use this structure; adjust names only if needed)
+Cell 0 — Markdown: Notebook overview + run order
+Cell 1 — Imports
+Cell 2 — CONFIG (paths, schemas, extensions, defaults, overrides)
+Cell 3 — Helper functions (path/list/move/sanitize/read/hash/decision helpers)
+Cell 4 — Ensure schemas/folders
+Cell 5 — Ensure Control tables (file_processing_control, ingestion_audit, etc.)
+Cell 6 — Discover client folders + files
+Cell 7 — File hashing
+Cell 8 — Idempotency + file version decision
+Cell 9 — Validation + duplicate checks (Bronze-level)
+Cell 10 — Quarantine / Excel exception handling actions
+Cell 11 — Read + transform to all-string + technical columns
+Cell 12 — Write Bronze Delta tables (APPEND for versioned loads)
+Cell 13 — Update control/audit statuses (SUCCESS/SKIPPED/FAILED)
+Cell 14 — Delta table versioning/history demo (DESCRIBE HISTORY / time travel examples)
+Cell 15 — Final summary/display
 
-Also:
-- Generate one batch_id per notebook run
-- Print/display a clear decision log per file: NEW / SKIP_SAME_CONTENT / NEW_VERSION / RETRY_FAILED and the file_version
-- At end, show summary: processed, skipped, failed, versions created
-- Keep Excel exception move behavior unchanged
-- Do not implement quarantine/validation/audit/full control registry in this change unless minimally required for this feature
-- Explain briefly in comments how same name+same content vs same name+different content is handled
+OUTPUT FORMAT
+1) Give the exact recommended cell order as a checklist.
+2) Produce the full notebook content cell by cell.
+   - For each cell, clearly label:
+     ### CELL N — Name
+     then the complete code for that cell.
+3) For each cell, include:
+   - Purpose
+   - Depends on
+   - What it outputs/creates
+4) Call out any tiny hook changes needed so cells work sequentially.
+5) Keep comments concise and practical.
+6) Ensure that running CELL1 → CELL15 in order works, and also Run All works.
 
-Output:
-1) Short explanation of the decision logic
-2) Exact table DDL / create logic
-3) Complete additive PySpark code (or clearly marked sections to paste) compatible with Fabric Lakehouse notebooks
-4) A small test checklist: new file, rerun same file, replace content same name, failed retry
+CONSTRAINTS
+- Fabric Lakehouse notebook + PySpark + mssparkutils
+- Additive/refactor for structure; do not invent unrelated features
+- Bronze business columns remain string
+- File version (INT) and Delta table version (BIGINT) must remain separate fields/types
+- Clear handling notes if a later cell depends on lists/dataframes created earlier (e.g., files_df, decisions_df, batch_id)
+
+Return only the segregated notebook cells and the short run-order guide.
+```
+
+Paste that with your current notebook when you want it split cell-by-cell for sequential or Run All execution.
