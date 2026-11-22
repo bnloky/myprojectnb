@@ -1,67 +1,269 @@
-I have an existing Microsoft Fabric Lakehouse PySpark notebook that loads Landing_zone files into Bronze and also creates/uses Control (metadata) tables inside the same notebook.
+Current table (what you already have)
+Control.file_processing_control — one row per file attempt/version
 
-GOAL
-- Extract ALL Control/metadata table CREATE logic out of the main notebook into a SEPARATE setup script/notebook.
-- Create those tables under the existing lakehouse schema named: Control
-- Do NOT disturb or rewrite the main Landing -> Bronze processing logic.
-- The main notebook should only ACCESS/USE the Control tables (read/write rows), not own the DDL/create definitions.
-- Give me separate code whose only job is: create required Control tables in Control schema (IF NOT EXISTS / safe re-run).
+Column	Type
+file_id
+STRING
+client_code
+STRING
+client_folder
+STRING
+source_path
+STRING
+file_name
+STRING
+file_size
+BIGINT
+sha256
+STRING
+file_version
+INT
+status
+STRING
+batch_id
+STRING
+target_table
+STRING
+row_count
+BIGINT
+processed_at
+TIMESTAMP
+error_message
+STRING
+Dependency map (from your columns)
+Your column	Depends on
+client_code, client_folder
+client_registry
+source_path, target_table (how to read/load)
+source_system_config + ingestion_config
+batch_id
+batch_run (or pipeline run)
+status, row_count, error_message (run summary)
+ingestion_audit
+target_table (optional catalog)
+table_registry (optional)
+1) Control.client_registry
+(depends from: client_code, client_folder)
 
-REQUIREMENTS
-1) Identify every Control/metadata table referenced by the notebook, including typical ones such as:
-   - Control.client_registry (if used)
-   - Control.source_system_config (if used)
-   - Control.ingestion_config (if used)
-   - Control.file_processing_control
-   - Control.ingestion_audit
-   - any other metadata/control tables present in my notebook
-2) Produce a SEPARATE notebook/script: NB_Control_Tables_Setup
-   - Cell(s) only for:
-     - imports (minimal)
-     - CONFIG (CONTROL_SCHEMA = "Control")
-     - CREATE SCHEMA IF NOT EXISTS Control
-     - CREATE each control table if not exists (Delta)
-     - optional: show tables / describe tables for verification
-3) Table creation must be idempotent:
-   - running setup multiple times must not fail
-   - use CREATE SCHEMA IF NOT EXISTS
-   - use CREATE TABLE IF NOT EXISTS (or equivalent safe Delta pattern in Fabric)
-4) Preserve correct column types, especially:
-   - file_version -> INT
-   - delta_table_version (if present) -> BIGINT
-   - sha256, paths, status, batch_id -> STRING
-   - row counts -> BIGINT/LONG
-   - timestamps -> TIMESTAMP
-5) Do NOT move business load logic into the setup notebook.
-6) Do NOT break main notebook access:
-   - show the minimal changes needed in the main notebook:
-     - remove/disable CREATE TABLE DDL for Control tables
-     - keep reads/writes to Control.* as-is
-     - add a short precondition check that required Control tables exist (fail with clear message if setup was not run)
-7) Keep Excel/Landing/Bronze behavior unchanged.
+Column	Type	Purpose
+client_id
+STRING / INT
+Primary key
+client_code
+STRING
+Matches file_processing_control.client_code
+client_name
+STRING
+Display name
+client_folder
+STRING
+Landing folder name
+landing_path
+STRING
+Files/Landing_zone/<client>
+is_active
+BOOLEAN
+Include/exclude client
+start_date
+DATE / STRING
+Active from
+end_date
+DATE / STRING
+Active to
+created_at
+TIMESTAMP
+Audit
+updated_at
+TIMESTAMP
+Audit
+2) Control.source_system_config
+(depends from: where files come from / source_path pattern)
 
-OUTPUT FORMAT
-1) List of Control/metadata tables to be created (name + purpose).
-2) Full separate setup notebook code, cell-wise if useful:
-   - CELL 1 Imports
-   - CELL 2 CONFIG
-   - CELL 3 Create Control schema
-   - CELL 4 Create control tables
-   - CELL 5 Verification (SHOW TABLES / DESCRIBE)
-3) Exact columns/DDL for each Control table.
-4) Minimal patch notes for the main notebook:
-   - what to delete (DDL only)
-   - what to keep (DML access)
-   - optional existence-check snippet
-5) Run order:
-   - First run NB_Control_Tables_Setup
-   - Then run main Landing -> Bronze notebook
+Column	Type	Purpose
+source_id
+STRING / INT
+Primary key
+client_id
+STRING / INT
+FK → client_registry
+client_code
+STRING
+Easy join
+source_code
+STRING
+e.g. cbg_landing
+source_type
+STRING
+LAKEHOUSE_FILES
+source_path
+STRING
+Base landing path
+is_active
+BOOLEAN
+On/off
+3) Control.ingestion_config
+(depends from: target_table, how file is parsed)
 
-CONSTRAINTS
-- Fabric Lakehouse + PySpark
-- Schema name: Control
-- Separate setup code only for control/metadata tables
-- Do not disturb existing processing code beyond removing embedded Control DDL and ensuring table access still works
-- Clear comments; production-safe re-runnable setup
+Column	Type	Purpose
+ingestion_id
+STRING / INT
+Primary key
+source_id
+STRING / INT
+FK → source_system_config
+client_code
+STRING
+Easy join
+file_pattern
+STRING
+e.g. *.txt, *.csv
+format
+STRING
+delimited
+delimiter
+STRING
+| or ,
+encoding
+STRING
+utf-8
+header_flag
+BOOLEAN
+Header yes/no
+target_schema
+STRING
+bronze
+target_table
+STRING
+Matches file_processing_control.target_table
+load_type
+STRING
+APPEND / FULL
+is_active
+BOOLEAN
+On/off
+4) Control.batch_run
+(depends from: batch_id)
 
-If my current notebook content is pasted below, base the extracted Control table DDL exactly on what the notebook expects (column names/types), and do not invent unrelated tables.
+Column	Type	Purpose
+batch_id
+STRING
+Primary key (same as in file_processing_control)
+pipeline_name
+STRING
+Notebook/pipeline name
+run_type
+STRING
+MANUAL / SCHEDULED
+triggered_by
+STRING
+User/system
+start_ts
+TIMESTAMP
+Batch start
+end_ts
+TIMESTAMP
+Batch end
+status
+STRING
+RUNNING / SUCCESS / FAILED
+files_total
+BIGINT
+Count
+files_success
+BIGINT
+Count
+files_skipped
+BIGINT
+Count
+files_failed
+BIGINT
+Count
+error_message
+STRING
+Batch-level error
+5) Control.ingestion_audit
+(depends from: status / row_count / errors — run-level audit)
+
+Column	Type	Purpose
+audit_id
+STRING
+Primary key
+batch_id
+STRING
+FK → batch_run
+file_id
+STRING
+FK → file_processing_control
+client_code
+STRING
+Client
+source_path
+STRING
+File path
+target_table
+STRING
+Bronze table
+start_ts
+TIMESTAMP
+File start
+end_ts
+TIMESTAMP
+File end
+source_rows
+BIGINT
+Read count
+loaded_rows
+BIGINT
+Written count
+rejected_rows
+BIGINT
+Rejected count
+status
+STRING
+SUCCESS/FAILED/SKIPPED
+error_message
+STRING
+Detail
+6) Control.table_registry (optional)
+(depends from: target_table)
+
+Column	Type	Purpose
+table_id
+STRING / INT
+Primary key
+schema_name
+STRING
+bronze
+table_name
+STRING
+e.g. cbg_claims_raw
+full_table_name
+STRING
+bronze.cbg_claims_raw
+client_code
+STRING
+Owner client
+layer
+STRING
+BRONZE
+is_active
+BOOLEAN
+On/off
+Suggested dependency order (create / understand)
+client_registry
+source_system_config
+ingestion_config
+table_registry (optional)
+batch_run
+file_processing_control (your current table)
+ingestion_audit
+Minimum set vs full set
+Need now for Landing → Bronze	Table
+Must have
+client_registry, ingestion_config, file_processing_control, batch_run
+Strongly useful
+ingestion_audit, source_system_config
+Optional
+table_registry
+Your current table is the file execution log. The others are master/config (client, source, ingestion) and run/audit (batch_run, ingestion_audit) that those columns point to.
+
