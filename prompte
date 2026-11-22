@@ -1,31 +1,67 @@
-1) Source root: Files/Landing_zone
-2) Each subfolder under Landing_zone is one client (e.g. CBG_Claims, Drexi_AMPS_Claims).
-3) For every client folder, discover files dynamically (including nested folders).
-4) Supported ingest extensions (delimited/text): .csv, .txt, .dat, .tsv, .psv, .pipe, .out, .log — make this set easy to extend.
-5) Read all supported files with Spark CSV reader, inferSchema=false, cast every business column to string so leading zeros, decimals, and large numeric text are preserved exactly.
-6) Support configurable delimiter/header:
-   - defaults: delimiter="|", header=True
-   - optional per-client overrides dictionary
-   - delimiter hints by extension (.csv=",", .tsv="\t", .txt="|", .dat="|", etc.)
-7) Create one Bronze Delta table per client:
-   - schema: bronze
-   - table name: <sanitized_client_folder>_raw (lowercase, underscores)
-   - mode overwrite for spike; overwriteSchema=true
-8) Add technical columns: _source_file, _source_path, _file_ext, _ingestion_ts, _client_code, _client_folder
-9) Sanitize column names before Delta write only (do not change cell values):
-   - lowercase
-   - replace invalid Delta chars (space, , ; { } ( ) newline tab =) with underscore
-   - collapse duplicate underscores
-10) Excel handling (IMPORTANT):
-   - Do NOT process Excel files (.xlsx, .xls, .xlsm, .xlsb)
-   - Move them under Files folder structure:
-     Files/Exceptions/<client_folder>/Excel/<original_file>
-   - Create Exceptions and client/Excel folders automatically if missing
-   - If destination file name already exists, append UTC timestamp to file name before move
-11) If a client has no ingestible files after moving Excel, skip load and report status.
-12) If multiple supported files exist for one client, union them into that client’s single Bronze table (unionByName allowMissingColumns=True).
-13) Print progress and display:
-   - sample rows per client
-   - final summary DataFrame: client_folder, bronze_table, row_count, files_loaded, excel_moved, excel_exception_path, status
-14) Do not build control tables, pipelines, archive, or quarantine yet — this is a spike notebook only.
-15) Use mssparkutils.fs for list/
+Add file-level IDEMPOTENCY and FILE VERSIONING to my existing Microsoft Fabric Lakehouse PySpark notebook that already loads Landing_zone client folders into Bronze (all columns as string). Do NOT rewrite the whole notebook into a large confusing control framework. Keep my current working load logic and add only what is needed for idempotency + file versioning.
+
+Context:
+- Source: Files/Landing_zone/<client_folder>/
+- One Bronze Delta table per client (all string columns)
+- Excel files are already moved to Files/Exceptions/<client>/Excel/ and must remain unprocessed
+- I want safe re-runs: same file content must not load twice; changed content under same name must load as a new file version
+
+Definitions to implement:
+1) Idempotency:
+   - Same source path/file name + SAME content hash + previous status SUCCESS => SKIP (do not load again, do not create duplicate Bronze rows)
+   - New file name/path never seen => PROCESS as version 1
+   - Previous FAILED for same path+hash => RETRY/PROCESS again
+2) File versioning:
+   - Same source path/file name + DIFFERENT content hash => treat as NEW file version
+   - file_version = last version for that path + 1
+   - PROCESS/load the new version
+   - Keep history of older versions in the control/tracking table (do not delete old SUCCESS rows)
+
+Required tracking table (create if not exists), keep it simple:
+Control.file_processing_control with columns like:
+- file_id (unique id per processing attempt/version)
+- client_code
+- client_folder
+- source_path
+- file_name
+- file_size
+- sha256
+- file_version (int)
+- status (RECEIVED / SUCCESS / SKIPPED / FAILED)
+- batch_id
+- target_table
+- row_count
+- processed_at
+- error_message
+
+Processing rules per data file:
+1. Discover supported files (.txt/.csv/.dat/etc.) under each client folder
+2. Compute SHA-256 of file content (scalable; do not load huge files fully into driver memory if avoidable)
+3. Look up latest record(s) for this source_path in Control.file_processing_control
+4. Decision:
+   - If exists SUCCESS with same sha256 => status SKIPPED, do not write to Bronze
+   - If no prior SUCCESS for this path => file_version=1, PROCESS
+   - If prior SUCCESS with different sha256 => file_version=max(previous)+1, PROCESS
+   - If prior FAILED with same sha256 and no SUCCESS => PROCESS retry with same version number logic you choose (document it)
+5. On PROCESS:
+   - Read file as all string (inferSchema=false)
+   - Append technical columns including: _source_path, _source_file, _file_sha256, _file_version, _batch_id, _ingestion_ts, _client_code
+   - Write to Bronze using APPEND for versioned loads (do not overwrite whole table just to simulate idempotency)
+   - After successful write, insert/update tracking row status=SUCCESS with row_count
+6. On failure:
+   - Record status=FAILED with error_message
+   - Do not mark SUCCESS
+
+Also:
+- Generate one batch_id per notebook run
+- Print/display a clear decision log per file: NEW / SKIP_SAME_CONTENT / NEW_VERSION / RETRY_FAILED and the file_version
+- At end, show summary: processed, skipped, failed, versions created
+- Keep Excel exception move behavior unchanged
+- Do not implement quarantine/validation/audit/full control registry in this change unless minimally required for this feature
+- Explain briefly in comments how same name+same content vs same name+different content is handled
+
+Output:
+1) Short explanation of the decision logic
+2) Exact table DDL / create logic
+3) Complete additive PySpark code (or clearly marked sections to paste) compatible with Fabric Lakehouse notebooks
+4) A small test checklist: new file, rerun same file, replace content same name, failed retry
