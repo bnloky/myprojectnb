@@ -1,0 +1,31 @@
+1) Source root: Files/Landing_zone
+2) Each subfolder under Landing_zone is one client (e.g. CBG_Claims, Drexi_AMPS_Claims).
+3) For every client folder, discover files dynamically (including nested folders).
+4) Supported ingest extensions (delimited/text): .csv, .txt, .dat, .tsv, .psv, .pipe, .out, .log — make this set easy to extend.
+5) Read all supported files with Spark CSV reader, inferSchema=false, cast every business column to string so leading zeros, decimals, and large numeric text are preserved exactly.
+6) Support configurable delimiter/header:
+   - defaults: delimiter="|", header=True
+   - optional per-client overrides dictionary
+   - delimiter hints by extension (.csv=",", .tsv="\t", .txt="|", .dat="|", etc.)
+7) Create one Bronze Delta table per client:
+   - schema: bronze
+   - table name: <sanitized_client_folder>_raw (lowercase, underscores)
+   - mode overwrite for spike; overwriteSchema=true
+8) Add technical columns: _source_file, _source_path, _file_ext, _ingestion_ts, _client_code, _client_folder
+9) Sanitize column names before Delta write only (do not change cell values):
+   - lowercase
+   - replace invalid Delta chars (space, , ; { } ( ) newline tab =) with underscore
+   - collapse duplicate underscores
+10) Excel handling (IMPORTANT):
+   - Do NOT process Excel files (.xlsx, .xls, .xlsm, .xlsb)
+   - Move them under Files folder structure:
+     Files/Exceptions/<client_folder>/Excel/<original_file>
+   - Create Exceptions and client/Excel folders automatically if missing
+   - If destination file name already exists, append UTC timestamp to file name before move
+11) If a client has no ingestible files after moving Excel, skip load and report status.
+12) If multiple supported files exist for one client, union them into that client’s single Bronze table (unionByName allowMissingColumns=True).
+13) Print progress and display:
+   - sample rows per client
+   - final summary DataFrame: client_folder, bronze_table, row_count, files_loaded, excel_moved, excel_exception_path, status
+14) Do not build control tables, pipelines, archive, or quarantine yet — this is a spike notebook only.
+15) Use mssparkutils.fs for list/
